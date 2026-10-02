@@ -417,6 +417,16 @@ impl Terminal {
         for arg in parts {
             cmd.arg(arg);
         }
+        // Say what kind of terminal this is.  TERM is normally inherited - a Git
+        // Bash parent has `xterm-256color` - but a shortcut or an Explorer launch
+        // has none, and a full screen program that reads TERM as unset or `dumb`
+        // draws a scrolled picture instead of using its screen.  Same for the two
+        // that programs probe to find out whether they are on a terminal at all.
+        if std::env::var_os("TERM").is_none() {
+            cmd.env("TERM", "xterm-256color");
+        }
+        cmd.env("TERM_PROGRAM", "tek-tube");
+        cmd.env("COLORTERM", "truecolor");
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 

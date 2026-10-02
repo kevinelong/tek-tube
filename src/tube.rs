@@ -1019,6 +1019,19 @@ impl Tube {
 /// Eight is where that trade stops paying here.
 const MAX_RENDER_THREADS: usize = 8;
 
+/// Least rows a thread is given.
+///
+/// Spawning costs more than a couple of rows cost to process, and `--threads`
+/// can ask for anything: 700 threads on a 1440-row pass would have asked for 480
+/// chunks - 480 threads a frame - so the count is capped by the work rather than
+/// taken at face value.
+const MIN_ROWS_PER_CHUNK: usize = 16;
+
+/// The threads a pass of `rows` rows may actually use.
+fn effective_threads(rows: usize, threads: usize) -> usize {
+    threads.min((rows / MIN_ROWS_PER_CHUNK).max(1))
+}
+
 /// Threads a pass may use, or 0 for "ask the machine".  A process-wide knob
 /// because the passes are free functions: `--threads N` sets it, and a machine
 /// where the render should not take the cores for itself can dial it down.
@@ -1059,7 +1072,8 @@ where
         return;
     }
     let rows = dst.len() / w;
-    if threads <= 1 || rows < threads * 2 {
+    let threads = effective_threads(rows, threads);
+    if threads <= 1 {
         for (y, row) in dst.chunks_mut(w).enumerate() {
             f(y, row);
         }
@@ -1099,7 +1113,8 @@ where
         return;
     }
     let rows = (a.len() / w).min(b.len() / w);
-    if threads <= 1 || rows < threads * 2 {
+    let threads = effective_threads(rows, threads);
+    if threads <= 1 {
         for ((y, ra), rb) in a.chunks_mut(w).enumerate().zip(b.chunks_mut(w)) {
             f(y, ra, rb);
         }
@@ -1831,6 +1846,18 @@ mod split_speed {
     /// that would have caught a splitter that quietly ran everything on one
     /// thread: it is deliberately loose (1.4x on a machine with 24 cores) so it
     /// cannot flake on a loaded one.
+    #[test]
+    fn a_thread_count_is_capped_by_the_work() {
+        // 1440 rows cannot use 10000 threads, and must not try: at a minimum of
+        // 16 rows a chunk the most it can use is 90.
+        assert_eq!(effective_threads(1440, 10000), 90);
+        assert_eq!(effective_threads(1440, 700), 90);
+        // a sane count is left alone, and too little work still means serial
+        assert_eq!(effective_threads(1440, 8), 8);
+        assert_eq!(effective_threads(10, 8), 1);
+        assert_eq!(effective_threads(0, 8), 1);
+    }
+
     #[test]
     fn the_split_uses_more_than_one_thread() {
         println!(
