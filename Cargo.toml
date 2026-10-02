@@ -1,0 +1,19 @@
+[package]
+name = "tek-tube"
+version = "0.1.0"
+edition = "2021"
+description = "Tektronix 4010/4014 storage-tube vector display emulator with phosphor persistence"
+license = "MIT"
+
+[dependencies]
+minifb = "0.28"
+png = "0.18"
+# ConPTY/pseudoconsole plumbing for terminal mode.  Hand-rolling this through
+# raw FFI was tried first and failed in ways that cost hours (see
+# docs/terminal-mode.md), so it is worth one dependency.
+portable-pty = "0.9"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
