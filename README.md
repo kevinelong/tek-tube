@@ -395,6 +395,33 @@ traced, which is what a pen is for.  Same measurement with the fix: the page is
 complete and the beam idle within a frame of the shell going quiet.  The recorded
 frames are in `cls3/` beside the source.
 
+**Two prompts, and a page that outlived its erase.**  Two separate faults both
+landed on the same symptom - a second `PS C:\Users\kevin>` after an `echo` or a
+`cls` - and both were measured on the live window against this machine's
+PowerShell before and after:
+
+* **One press of Enter put three carriage returns on the wire.**  Windows
+  reports a real key press twice: `WM_KEYDOWN` as a key event, the `WM_CHAR`
+  translated from it as a character event, and a second `WM_CHAR` after the key
+  is released.  Both paths translated the same key, so the shell ran the command
+  plus *two empty ones*.  Measured: `echo hi` was followed by three prompts.
+  The key event is the report that carries the modifiers, so the key path now
+  owns every control key and the character path sends text only (`window_input`
+  in `src/terminal.rs`), which is one prompt, and the two `WM_CHAR`s landing in
+  different frames no longer matters.  The cost is a pasted line break, which
+  arrives as a character with no key event - this is a terminal with no
+  bracketed paste, and one doubled Enter per press is a worse trade than that.
+* **A page replacement cleared the stored charge but not the beam's glow.**  A
+  scroll, a clear or an alt screen switch replaces the image, and the previous
+  page is still in the transient population, so it stayed lit for the whole
+  trail: after a `cls` the old prompt and the erased tail of the old command
+  line were still glowing under the new one (measured: 10 ghost cells, and the
+  dumped stream showed the `echo hi` line's own cells at row 17).  `commit_to`
+  now erases the transient with the stored image on a replacement - and only
+  there: on the pen's own path the flash is the writing, cooling into the stored
+  image.  Measured after: the only lit cell the screen does not have is the
+  cursor.
+
 **The frame is split across the cores where it can be.**  The render is a
 per-pixel map plus separable blurs, and a fullscreen 2560x1440 tube is 3.7M
 pixels a frame.  The splitter itself measures **5.5x on 8 threads** (37.8 ms ->
@@ -500,12 +527,12 @@ When the screen has been quiet for 0.3 s the current screen is *committed*: the
 stored image is erased and the screen is re-stroked into it without lighting the
 beam, so the smear **resolves** to a crisp stored image.  The commit replaces
 rather than merges, which is what stops scrolled-away text from ghosting for
-ever.  `--trail F` sets how long the transient lingers - the default is 0.3 s,
-a quick cool from the near-white flash to the stored acid green, which is what
-the tube does and settles the hue in well under a second; `--trail 0` is a plain
-storage tube with no smear at all, and longer values (the original default was
-1.1 s) leave the writing visibly fading for a second, which reads as slow and
-steps visibly at any window's frame rate.
+ever.  `--trail F` sets how long the transient lingers: a plot file's default is
+0.3 s and the terminal's is 1.1 s, a quick cool from the near-white flash to the
+stored acid green that settles the hue in well under a second; `--trail 0` is a
+plain storage tube with no smear at all, and longer values leave the writing
+visibly fading for a second, which reads as slow and steps visibly at any
+window's frame rate.
 
 * **Ctrl+Shift+Q** quits, or just exit the shell.  ESC has to reach the shell,
   so it can no longer be the quit key, and **F11** - which the shell has no use
@@ -514,6 +541,8 @@ steps visibly at any window's frame rate.
 * Keys without a character are translated to VT sequences (arrows, F1-F12,
   Home/End/PgUp/PgDn, Insert/Delete, Ctrl+letter); printable text goes through
   minifb's Unicode input, so keyboard layout and AltGr are handled for you.
+  Control characters come from the **key** path only - the character path's copy
+  of them was the doubled Enter described above.
 * `CSI 6n` - the console host asking where the cursor is - is answered from the
   screen's real cursor position.  Answering it with a fixed value lets the
   session run but corrupts PSReadLine's redraw into overlapping text.

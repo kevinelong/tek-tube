@@ -113,6 +113,87 @@ pub enum Input {
     Key(Key, bool),
 }
 
+/// The modifier keys the window has reported.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Mods {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+/// What a batch of window input asks the terminal to do.
+#[derive(Default)]
+pub struct InputBatch {
+    /// The bytes for the shell.
+    pub bytes: Vec<u8>,
+    pub mods: Mods,
+    pub fullscreen: bool,
+    pub scroll_lines: i32,
+}
+
+/// Translate one batch of window input into the bytes the shell should receive,
+/// plus the terminal's own actions.
+///
+/// A control character **never** comes from the character path.  A real key
+/// press arrives from Windows twice - `WM_KEYDOWN` as a key event and the
+/// `WM_CHAR` translated from it as a character event, and a second `WM_CHAR`
+/// follows - and both paths translate the same key, so one press of Enter put
+/// three carriage returns on the wire: the shell ran the command plus two empty
+/// ones and the tube showed two prompts where there should be one, which is
+/// exactly the "two prompts after an echo or a cls" fault.  Deduplicating within
+/// a batch is not enough, because the stray `WM_CHAR` can arrive a frame later;
+/// the key event is the report that carries the modifiers, so the key path owns
+/// every control key and the character path sends text only.
+///
+/// The cost is a pasted line break, which arrives as a character with no key
+/// event.  This is a terminal with no bracketed paste, and a doubled Enter on
+/// every press is a far worse trade than that.
+pub fn window_input(events: &[Input], mut mods: Mods, scroll_step: i32) -> InputBatch {
+    let mut out = InputBatch::default();
+    for ev in events {
+        match ev {
+            Input::Text(c) => {
+                // text only: see the note above
+                let ch = *c;
+                if (ch as u32) < 0x20 || ch as u32 == 0x7f {
+                    continue;
+                }
+                let mut buf = [0u8; 4];
+                out.bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            Input::Key(key, down) => {
+                match key {
+                    Key::LeftCtrl | Key::RightCtrl => mods.ctrl = *down,
+                    Key::LeftAlt | Key::RightAlt => mods.alt = *down,
+                    Key::LeftShift | Key::RightShift => mods.shift = *down,
+                    _ => {}
+                }
+                if !down {
+                    continue;
+                }
+                // F11 is the window's, not the shell's: it toggles fullscreen, so
+                // it must not go down the wire as a key sequence the shell would
+                // see as text
+                if *key == Key::F11 {
+                    out.fullscreen = true;
+                // Shift+PageUp/PageDown read the scrollback, so they are consumed
+                // here rather than sent to the shell
+                } else if mods.shift && matches!(key, Key::PageUp | Key::PageDown) {
+                    out.scroll_lines = if *key == Key::PageUp {
+                        scroll_step
+                    } else {
+                        -scroll_step
+                    };
+                } else if let Some(bytes) = key_sequence(*key, mods.ctrl, mods.alt) {
+                    out.bytes.extend_from_slice(&bytes);
+                }
+            }
+        }
+    }
+    out.mods = mods;
+    out
+}
+
 struct WindowInput {
     tx: Sender<Input>,
 }
@@ -577,39 +658,32 @@ impl Terminal {
             }
         }
 
-        // input from the window
-        let mut typed = Vec::new();
+        // input from the window, drained as a batch first: a real key press
+        // arrives twice, and `window_input` is what keeps it from going down the
+        // wire twice (see there)
+        let mut events = Vec::new();
         while let Ok(ev) = self.input_rx.try_recv() {
-            match ev {
-                Input::Text(c) => {
-                    let mut buf = [0u8; 4];
-                    typed.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-                }
-                Input::Key(key, down) => {
-                    match key {
-                        Key::LeftCtrl | Key::RightCtrl => self.ctrl = down,
-                        Key::LeftAlt | Key::RightAlt => self.alt = down,
-                        Key::LeftShift | Key::RightShift => self.shift = down,
-                        _ => {}
-                    }
-                    if down {
-                        // F11 is the window's, not the shell's: it toggles
-                        // fullscreen, so it must not go down the wire as a key
-                        // sequence the shell would see as text
-                        if key == Key::F11 {
-                            self.toggle_fullscreen = true;
-                        // Shift+PageUp/PageDown read the scrollback, so they are
-                        // consumed here rather than sent to the shell
-                        } else if self.shift && matches!(key, Key::PageUp | Key::PageDown) {
-                            let step = self.rows as i32 - 1;
-                            self.scroll_view(if key == Key::PageUp { step } else { -step });
-                        } else if let Some(bytes) = key_sequence(key, self.ctrl, self.alt) {
-                            typed.extend_from_slice(&bytes);
-                        }
-                    }
-                }
-            }
+            events.push(ev);
         }
+        let batch = window_input(
+            &events,
+            Mods {
+                ctrl: self.ctrl,
+                alt: self.alt,
+                shift: self.shift,
+            },
+            self.rows as i32 - 1,
+        );
+        self.ctrl = batch.mods.ctrl;
+        self.alt = batch.mods.alt;
+        self.shift = batch.mods.shift;
+        if batch.fullscreen {
+            self.toggle_fullscreen = true;
+        }
+        if batch.scroll_lines != 0 {
+            self.scroll_view(batch.scroll_lines);
+        }
+        let typed = batch.bytes;
         let typed_input = !typed.is_empty();
         if typed_input {
             self.keys_in += typed.len();
@@ -691,15 +765,21 @@ impl Terminal {
     /// game away, and *not* committing until the pen finished meant a slow pen
     /// never resolved at all, so the image faded all the way to nothing instead
     /// of cooling from the bright flash to the stored green.
+    ///
+    /// A page replacement is not that at all: see `commit_to`, which erases the
+    /// transient glow with the stored image so the page before it cannot shine
+    /// through the new one.
     pub fn commit(&mut self, tube: &mut Tube) {
-        tube.clear_stored();
-        if self.write_rate.is_some() && !self.page_replaced {
-            self.pen
-                .settle_drawn(tube, &self.screen, self.cols, self.rows);
-        } else {
-            // no pen at all, or a page replacement: the whole page in one go
-            self.stroke_screen(tube, Write::Settle, false);
-        }
+        let traced = self.write_rate.is_some() && !self.page_replaced;
+        commit_to(
+            tube,
+            &self.screen,
+            &mut self.pen,
+            self.cols,
+            self.rows,
+            traced,
+            self.scroll,
+        );
         self.page_replaced = false;
         self.committed = true;
         self.commits += 1;
@@ -822,6 +902,38 @@ pub fn stroke_screen(
     }
     if cursor {
         draw_cursor(screen, scroll, cols, rows, tube, write);
+    }
+}
+
+/// Write a committed image to the tube: what `Terminal::commit` does, as a free
+/// function so it can be exercised without a pseudoconsole.
+///
+/// `traced` is the pen's path - the screen has *not* moved as a whole, so the
+/// image is settled from the cells the pen has drawn and the beam's own flash is
+/// left to cool into it.  Everything else is a page replacement, and a
+/// replacement has to take the *glow* as well as the stored charge: the previous
+/// page is still in the transient population, so clearing only the stored image
+/// left the old glyphs lit for the whole trail.  That is what put a second
+/// prompt on the tube after an `echo` or a `cls`, with the erased tail of the
+/// previous command line still glowing under the new one - measured on the live
+/// window with a 1.1 s trail, so the ghost outlived a whole command.
+pub fn commit_to(
+    tube: &mut Tube,
+    screen: &vt::Screen,
+    pen: &mut Pen,
+    cols: usize,
+    rows: usize,
+    traced: bool,
+    scroll: f32,
+) {
+    if traced {
+        tube.clear_stored();
+        pen.settle_drawn(tube, screen, cols, rows);
+    } else {
+        // no pen at all, or a page replacement: the whole page in one go, and
+        // nothing of the page before it
+        tube.erase();
+        stroke_screen(screen, scroll, cols, rows, tube, Write::Settle, false);
     }
 }
 
@@ -991,6 +1103,64 @@ mod tests {
         // and keys we have no mapping for
         assert_eq!(key_sequence(Key::LeftShift, false, false), None);
         assert_eq!(key_sequence(Key::NumPad5, false, false), None);
+    }
+
+    /// One press of Enter reaches the window twice - Windows sends `WM_KEYDOWN`
+    /// as a key event and the `WM_CHAR` translated from it as a character event,
+    /// and a second `WM_CHAR` follows the key release - and both paths translate
+    /// it.  Three carriage returns on the wire is the command plus two empty
+    /// ones: the two-extra-prompts fault, seen after `echo` and after `cls`.
+    #[test]
+    fn one_enter_press_sends_one_carriage_return() {
+        let events = [
+            Input::Key(Key::Enter, true),
+            Input::Text('\r'),
+            Input::Key(Key::Enter, false),
+            Input::Text('\r'),
+        ];
+        let batch = window_input(&events, Mods::default(), 17);
+        assert_eq!(batch.bytes, b"\r");
+    }
+
+    /// The same for Backspace, which the two paths spell differently (0x7f from
+    /// the key, 0x08 from the character), and for Ctrl+letter, which the
+    /// character path reports as the C0 control itself.
+    #[test]
+    fn the_other_doubled_keys_are_sent_once_too() {
+        let bs = [
+            Input::Key(Key::Backspace, true),
+            Input::Text('\x08'),
+            Input::Key(Key::Backspace, false),
+            Input::Text('\x08'),
+        ];
+        assert_eq!(window_input(&bs, Mods::default(), 17).bytes, b"\x7f");
+
+        let ctrl_c = [
+            Input::Key(Key::LeftCtrl, true),
+            Input::Key(Key::C, true),
+            Input::Text('\x03'),
+            Input::Key(Key::C, false),
+            Input::Key(Key::LeftCtrl, false),
+        ];
+        let batch = window_input(&ctrl_c, Mods::default(), 17);
+        assert_eq!(batch.bytes, b"\x03");
+        assert!(!batch.mods.ctrl, "the modifier state comes back with it");
+    }
+
+    /// A control character never comes from the character path, because it is
+    /// always reported as a key as well.  The one casualty is a pasted line
+    /// break, which arrives as a character with no key event - this is a
+    /// terminal with no bracketed paste, and one doubled Enter per press is a
+    /// much worse trade than that.
+    #[test]
+    fn control_characters_never_come_from_the_character_path() {
+        let events = [
+            Input::Text('a'),
+            Input::Text('\r'),
+            Input::Text('b'),
+            Input::Text('\t'),
+        ];
+        assert_eq!(window_input(&events, Mods::default(), 17).bytes, b"ab");
     }
 
     /// The heart of terminal mode: content written while it is still moving
@@ -1190,6 +1360,59 @@ mod tests {
         assert!(lit > 140, "the replaced page must be stored, got {lit}");
     }
 
+    /// A page replacement takes the previous page's *glow* with it, not just its
+    /// stored charge.
+    ///
+    /// The shell erases the tail of the command line and writes a new prompt;
+    /// the erased glyphs are still in the transient population, and with only
+    /// the stored image cleared they stayed lit for the whole trail - which is
+    /// what showed the old prompt with the old command still on it, twice over,
+    /// after an `echo` or a `cls`.
+    #[test]
+    fn a_page_replacement_erases_the_previous_page_s_glow_too() {
+        let mut tube = Tube::new(1024, 780);
+        let mut screen = vt::Screen::new(74, 18);
+        let mut parser = vt::Parser::new();
+        parser.feed(b"PS C:\\Users\\kevin> echo hi", &mut screen);
+        let mut pen = Pen::new(74 * 18);
+
+        // the page the shell has written, and the erased tail of the command
+        // line it has just taken away - which is in the transient population only
+        stroke_screen(&screen, 0.0, 74, 18, &mut tube, Write::Settle, false);
+        let flash = Style {
+            line: LineStyle::Solid,
+            defocus: false,
+            write: Write::Flash,
+        };
+        tube.character(b'e', 300.0, 700.0, 20, 30, flash, 1.0);
+        assert!(
+            glow_pixels(&mut tube) > 0,
+            "the erased glyph should still be glowing"
+        );
+
+        // a clear of the display (or a scroll) is a page replacement
+        parser.feed(b"\x1b[2J", &mut screen);
+        commit_to(&mut tube, &screen, &mut pen, 74, 18, false, 0.0);
+        assert_eq!(
+            glow_pixels(&mut tube),
+            0,
+            "a replaced page must not leave the old glyphs shining through"
+        );
+    }
+
+    /// Pixels that come only from the transient population: render with the
+    /// stored charge switched off, so nothing but the beam's own glow is left.
+    /// The flood gun's field is dimmer than the threshold, as it is in the
+    /// lit-pixel checks above.
+    fn glow_pixels(tube: &mut Tube) -> usize {
+        let stored_gain = tube.phosphor.stored_gain;
+        tube.phosphor.stored_gain = 0.0;
+        let mut buf = Vec::new();
+        tube.render_into(&mut buf, 1, 1);
+        tube.phosphor.stored_gain = stored_gain;
+        buf.iter().filter(|p| ((**p >> 8) & 0xff) > 100).count()
+    }
+
     /// The pen spends its budget in dots, which is what makes `--write-rate`
     /// mean dots per second and its default of 4000 mean about 65 letters a
     /// second.
@@ -1344,3 +1567,4 @@ mod tests {
         );
     }
 }
+
