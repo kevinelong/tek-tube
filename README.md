@@ -414,7 +414,19 @@ half that was 28% of the frame.
 
 Measured on the running terminal - debug build, 1024x780, from the exit summary -
 173 frames at **51.4 ms each, 19 fps while drawing**: against 89.6 ms windowed
-before the vertical split and 245.7 ms before any of it.  The release profile is
+before the vertical split and 245.7 ms before any of it.
+
+**Tried, measured and reverted: blocking the vertical pass.**  The step that
+follows from the memory story is to stop walking a row-major buffer with a stride
+at all - give each thread a *run* of columns, rows outer, so every cache line is
+consumed whole.  It was implemented, blocked 16 columns by 32 rows, and measured:
+**77.7 ms a frame against 49.4 ms**, a 57% *regression*.  In this profile the
+per-element cost of the blocked loops (array indexing, iterator machinery) dwarfs
+the cache effect they buy; in a release build the balance is very likely the other
+way, and a release build is the one thing this machine will not produce.  So the
+change could not be verified in the profile where it would pay, and it was
+reverted rather than shipped unverified.  The analysis stands: this is the first
+thing to try if a release build ever appears.  The release profile is
 where this matters, and the same code is an order of magnitude cheaper there.  A
 release build cannot be produced on this machine at the moment: Smart App Control
 refused nineteen fresh hashes in a row (see the note at the end).
