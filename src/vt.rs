@@ -18,6 +18,19 @@
 //! * ECH (`CSI nX`) is how PSReadLine erases as it redraws a line; get it wrong
 //!   and the prompt accumulates garbage.
 
+/// How the page moved as a whole since the renderer last asked.
+///
+/// A scroll is not a clear: the committed image can move with it and only the
+/// lines that scrolled in are new, so the renderer slides the image instead of
+/// rewriting the page.  Everything else - an erase of the display, an alt screen
+/// switch, a resize - replaces the page.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PageChange {
+    None,
+    Scroll(usize),
+    Wholesale,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Attr {
     /// SGR colour index, mapped to a brightness for a monochrome green tube.
@@ -54,10 +67,9 @@ pub struct Screen {
     /// which is how full-screen programs keep the shell's scrollback intact
     /// while they own the page.
     alt_saved: Option<Box<AltSaved>>,
-    /// Set when the page moved as a whole: a scroll, an erase of the display, or
-    /// an alt-screen switch.  Taken by the renderer, which cannot trace one of
-    /// those - every cell has changed, so the image is replaced instead.
-    page_reset: bool,
+    /// How the page moved as a whole: a scroll carries the committed image with
+    /// it, anything else replaces it.
+    change: PageChange,
 }
 
 /// How much scrollback to keep.  A storage tube holds one page; this is a
@@ -95,7 +107,7 @@ impl Screen {
             history: std::collections::VecDeque::new(),
             view: 0,
             alt_saved: None,
-            page_reset: false,
+            change: PageChange::None,
         }
     }
 
@@ -119,7 +131,7 @@ impl Screen {
             self.cy = 0;
         }
         let _ = clear;
-        self.page_reset = true;
+        self.change = PageChange::Wholesale;
         self.dirty.iter_mut().for_each(|d| *d = true);
     }
 
@@ -134,15 +146,15 @@ impl Screen {
                 self.cx = prev.cx.min(self.cols - 1);
                 self.cy = prev.cy.min(self.rows - 1);
             }
-            self.page_reset = true;
+            self.change = PageChange::Wholesale;
             self.dirty.iter_mut().for_each(|d| *d = true);
         }
     }
 
-    /// Has the page moved as a whole since this was last asked?  Taken rather
-    /// than read: one scroll is one replacement.
-    pub fn take_page_reset(&mut self) -> bool {
-        std::mem::take(&mut self.page_reset)
+    /// How the page moved as a whole since this was last asked?  Taken rather
+    /// than read: one scroll is one move.
+    pub fn take_page_change(&mut self) -> PageChange {
+        std::mem::replace(&mut self.change, PageChange::None)
     }
 
     pub fn in_alt_screen(&self) -> bool {
@@ -208,7 +220,7 @@ impl Screen {
         self.cy = 0;
         self.pending_wrap = false;
         self.view = 0;
-        self.page_reset = true;
+        self.change = PageChange::Wholesale;
         self.dirty.iter_mut().for_each(|d| *d = true);
     }
 
@@ -287,8 +299,14 @@ impl Screen {
 
     /// Scroll the region up by `n`, blanking the exposed lines.
     pub fn scroll_up(&mut self, n: usize) {
-        // whatever the pen has drawn now describes the wrong rows
-        self.page_reset = true;
+        // The image moves with the page: the rows that scroll off the top are
+        // gone and only the lines that scrolled in are new.  A clear that arrives
+        // with it wins - that is a replacement, not a move.
+        self.change = match self.change {
+            PageChange::Scroll(k) => PageChange::Scroll(k + n),
+            PageChange::Wholesale => PageChange::Wholesale,
+            PageChange::None => PageChange::Scroll(n),
+        };
         for _ in 0..n {
             let (top, bottom) = (self.scroll_top, self.scroll_bottom);
             let width = self.cols;
@@ -389,7 +407,7 @@ impl Screen {
 
     pub fn erase_display(&mut self, mode: u16) {
         // a clear takes the whole page away from whatever was drawn on it
-        self.page_reset = true;
+        self.change = PageChange::Wholesale;
         if mode >= 2 {
             // a full clear discards the scrollback too, as it does on hardware
             self.history.clear();
@@ -1054,10 +1072,35 @@ mod tests {
         }
         assert_eq!(s.history_len(), history, "the scrollback must survive");
         assert_eq!((s.cx, s.cy), (0, 0), "and the cursor goes home");
-        assert!(
-            s.take_page_reset(),
+        assert_eq!(
+            s.take_page_change(),
+            PageChange::Wholesale,
             "and the renderer is told to replace the page"
         );
+    }
+
+    /// A scroll says *how far* it moved, because the image moves with it; a
+    /// clear says nothing but "replace".
+    #[test]
+    fn a_scroll_reports_how_far_the_page_moved() {
+        let mut s = Screen::new(12, 3);
+        let mut p = Parser::new();
+        p.feed(b"one\r\ntwo\r\nthree", &mut s);
+        assert_eq!(s.take_page_change(), PageChange::None, "three rows fit");
+
+        // the next line scrolls the page once
+        p.feed(b"\r\nfour", &mut s);
+        assert_eq!(s.take_page_change(), PageChange::Scroll(1));
+        assert_eq!(s.take_page_change(), PageChange::None, "and only once");
+
+        // two more lines add up rather than being lost
+        p.feed(b"\r\nfive\r\nsix", &mut s);
+        assert_eq!(s.take_page_change(), PageChange::Scroll(2));
+
+        // a clear is not a move, and it wins if the two arrive together
+        p.feed(b"\r\nseven", &mut s);
+        p.feed(b"\x1b[2J", &mut s);
+        assert_eq!(s.take_page_change(), PageChange::Wholesale);
     }
 
     #[test]

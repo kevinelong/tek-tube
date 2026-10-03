@@ -639,7 +639,7 @@ fn replay_terminal(path: &PathBuf, opts: &Options) -> Result<(), Box<dyn Error>>
 
     let mut tube = Tube::new(tw, th);
     configure_terminal_tube(&mut tube, dev, opts, cell);
-    terminal::stroke_screen(&screen, 0.0, cols, rows, &mut tube, Write::Settle, true);
+    terminal::stroke_screen(&screen, cols, rows, &mut tube, Write::Settle, true);
     let mut buf = Vec::new();
     tube.render_into(&mut buf, shrink, opts.zoom);
     write_png(&out, &buf, ow, oh)?;

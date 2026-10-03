@@ -380,20 +380,30 @@ commits wiped the image back to whatever the pen had managed so far.  Content
 appeared, vanished, and was drawn again over itself.
 
 The other half of it is that a *wholesale* change is not something to trace at
-all.  A scroll, a clear, an alt-screen switch or a resize changes every cell at
-once; tracing a 37x18 page takes minutes at any rate slow enough to watch to be
-worth watching, and a storage tube cannot scroll anyway - it can only be
-rewritten.  The screen says when that has happened - a scroll, an erase of the
-display, or an alt-screen switch sets a flag the renderer takes - and that signal
-is the one that matters, because the share of changed cells does not catch them
-on a sparse page: a listing scrolling past changes every *row* but only three or
-four cells in each, which on a 93x32 page is a few per cent.  A quarter of the
-cells changing remains as a backstop for anything else that redraws the page
-without saying so.  Either way the pen's record is synced to the screen and the
-next commit settles the whole page in one go; only incremental changes are
-traced, which is what a pen is for.  Same measurement with the fix: the page is
-complete and the beam idle within a frame of the shell going quiet.  The recorded
-frames are in `cls3/` beside the source.
+all.  A clear, an alt-screen switch or a resize changes every cell at once, and
+tracing a 37x18 page takes minutes at any rate slow enough to watch to be worth
+watching.  The screen says when that has happened - it reports the change rather
+than leaving the renderer to infer it from the share of changed cells, which does
+not catch a scroll on a sparse page: a listing scrolling past changes every *row*
+but only three or four cells in each, which on a 93x32 page is a few per cent.  A
+quarter of the cells changing remains as a backstop for anything else that
+redraws most of the page.
+
+A **scroll is neither** - it is a move, and it is the one page-wide change worth
+showing.  The committed image is a bitmap, so it can travel: a scroll shifts the
+stored charge, the beam's glow and the record up the face by the lines that
+scrolled off (`Tube::shift_rows`), the record is synced so nothing is retraced,
+and the page is settled in one pass.  Nothing is drawn character by character for
+it.  The *display* then slides the move into place at `SLIDE_RATE` (30 rows a
+second, capped at one page, so a two hundred line listing is one screenful rising
+into view rather than a two hundred line movement).  Measured on a fullscreen
+93x32 page running `dir C:\Windows`: the topmost line goes 27, 22, 18, 1, 0 over
+about a second while the ink climbs 31k, 83k, 124k, 281k, with no blank frame -
+the page moves, and nothing is rewritten by the beam to make it move.
+
+Only incremental changes are traced, which is what a pen is for.  Same
+measurement with the fix: the page is complete and the beam idle within a frame
+of the shell going quiet.  The recorded frames are in `cls3/` beside the source.
 
 **Two prompts, and a page that outlived its erase.**  Two separate faults both
 landed on the same symptom - a second `PS C:\Users\kevin>` after an `echo` or a

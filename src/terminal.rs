@@ -22,6 +22,7 @@
 use crate::protocol::{LineStyle, Style, Write};
 use crate::tube::Tube;
 use crate::vt;
+use crate::vt::PageChange;
 use minifb::Key;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write as IoWrite};
@@ -88,13 +89,10 @@ pub fn page_for_window(w: usize, h: usize, scale: f32) -> (usize, usize) {
 /// Above this share of the page, a change is a page replacement rather than
 /// something to trace.
 ///
-/// A scroll, a clear, an alt screen switch or a resize change the whole page at
-/// once.  Tracing that is hopeless - at any beam rate slow enough to watch, a
-/// 37x18 page is minutes of drawing - and it is not what the tube does anyway:
-/// it cannot scroll, it can only be rewritten.  So a wholesale change replaces
-/// the image in one go, and only an incremental change is traced.  This is also
-/// what stops the doubled drawing: a page that has already moved on can no
-/// longer be retraced on top of the image it left behind.
+/// A clear, an alt screen switch or a resize changes the whole page at once and
+/// is reported as such; this is the backstop for anything else that redraws most
+/// of the page without saying so.  A *scroll* is not one of these - the image
+/// moves with it - so it is handled before this is asked.
 pub fn wholesale(stale: usize, cells: usize) -> bool {
     stale * 4 > cells
 }
@@ -104,8 +102,9 @@ pub const COMMIT_QUIET: f32 = 0.30;
 /// ... and the longest a continuously changing screen may stay un-committed, so
 /// that a busy screen still resolves instead of smearing for ever.
 pub const COMMIT_MAX: f32 = 0.55;
-/// Rows per second the smooth scroll slides at.
-pub const SCROLL_RATE: f32 = 9.0;
+/// Rows per second a scroll slides at.  A scroll is a *move* of the committed
+/// image, not a redraw, so this is only how fast the eye sees it happen.
+pub const SLIDE_RATE: f32 = 30.0;
 
 /// Input the window hands to the terminal.
 pub enum Input {
@@ -449,8 +448,10 @@ pub struct Terminal {
     quiet: f32,
     since_commit: f32,
     committed: bool,
-    /// Smooth scroll: how far the content still has to slide up, in rows.
-    scroll: f32,
+    /// How far the display still has to slide up, in rows, and how many lines of
+    /// scroll the committed image has not been moved for yet.
+    slide: f32,
+    pending_scroll: usize,
     /// The writing pen, used only when a write rate is set.
     pen: Pen,
     /// Target dots per second the pen draws at; None writes instantly.
@@ -556,7 +557,8 @@ impl Terminal {
             quiet: 0.0,
             since_commit: 0.0,
             committed: false,
-            scroll: 0.0,
+            slide: 0.0,
+            pending_scroll: 0,
             ctrl: false,
             alt: false,
             shift: false,
@@ -694,42 +696,58 @@ impl Terminal {
         // the screen may also have changed without new bytes (a scroll)
         let dirty = self.screen.take_dirty();
         let changed = new_bytes || typed_input || dirty.iter().any(|d| *d);
-        if self.write_rate.is_none() && dirty.iter().any(|d| *d) {
-            // The smooth scroll is for the penless path, where every commit
-            // re-strokes the whole page from the screen, so an offset animates
-            // the shift.  With the pen on there is no offset any more: the pen's
-            // tracing and its record both draw at the unscrolled position, so a
-            // commit that honoured the offset stored the page shifted while the
-            // beam drew it straight - which is what put two prompts on the tube
-            // at once after an Enter at the bottom of the page.
-            //
-            // one line of scroll per frame is plenty to animate
-            self.scroll = (self.scroll + 1.0).min(2.0);
-        }
-
-        // smooth scroll decays toward zero
-        if self.scroll > 0.0 {
-            self.scroll = (self.scroll - SCROLL_RATE * dt).max(0.0);
-        }
-
-        // A change too large to trace is a page replacement: sync the record so
-        // nothing is retraced, and let the commit settle the whole page at once.
+        // A page-wide change is a move or a replacement, and the screen says
+        // which.  A *scroll* carries the committed image with it: the image is
+        // moved, the record is synced to the moved page, and only the lines that
+        // scrolled in are new - so nothing has to be traced, and the display
+        // slides the whole thing into place over the next few frames.  A clear,
+        // an alt screen switch or a resize replaces the page instead: the record
+        // is synced and the whole page is settled at once.
         //
-        // The screen says so directly for a scroll, a clear or an alt screen
-        // switch, and that is the signal that matters: the share of changed cells
-        // does not catch them on a sparse page.  A listing scrolling past changes
-        // every *row* but only three or four cells in each, which on a 93x32 page
-        // is a few per cent - and it was exactly that case, a cls then a long
-        // listing, where the tube was measured still drawing the page 7.5s after
-        // the shell had gone quiet.
-        let reset = self.screen.take_page_reset();
+        // The cell-share backstop is for anything that redraws most of the page
+        // without saying so.  It does not catch a scroll on a sparse page: a
+        // listing changes every *row* but only three or four cells in each, which
+        // on a 93x32 page is a few per cent.
+        match self.screen.take_page_change() {
+            PageChange::Scroll(lines) => {
+                self.pending_scroll += lines;
+                // The slide starts where the page was: the image has moved up and
+                // the offset brings it back into place.  It is capped at one page,
+                // because a listing of two hundred lines is not a two hundred line
+                // movement - the visible part of it is one screenful rising into
+                // view, and an uncapped offset would push the whole page off the
+                // bottom and show nothing for a second.
+                let cap = self.rows.max(2) as f32 - 1.0;
+                self.slide = (self.slide + lines as f32).min(cap);
+                // settle it now, so the moved page is what slides
+                self.committed = false;
+                self.quiet = COMMIT_QUIET;
+            }
+            PageChange::Wholesale => {
+                self.pen.sync(&self.screen);
+                self.page_replaced = true;
+                self.committed = false;
+                self.pending_scroll = 0;
+                self.slide = 0.0;
+            }
+            PageChange::None => {}
+        }
         if self.write_rate.is_some()
-            && (reset || wholesale(self.pen.stale(&self.screen), self.cols * self.rows))
+            && !self.page_replaced
+            && wholesale(self.pen.stale(&self.screen), self.cols * self.rows)
         {
             self.pen.sync(&self.screen);
             self.page_replaced = true;
             self.committed = false;
         }
+
+        // the slide decays toward zero: rows per second, so a long scroll is a
+        // quick slide rather than a jump
+        let was_sliding = self.slide > 0.0;
+        if was_sliding {
+            self.slide = (self.slide - SLIDE_RATE * dt).max(0.0);
+        }
+        let sliding = was_sliding || self.slide > 0.0;
 
         // commit bookkeeping
         if changed {
@@ -744,18 +762,15 @@ impl Terminal {
             self.quiet = 0.0;
             self.committed = false;
         }
-        let due = (!self.committed && self.quiet >= COMMIT_QUIET)
-            || (self.since_commit >= COMMIT_MAX && (!self.committed || self.scroll > 0.0));
+        let due = !self.committed && (self.quiet >= COMMIT_QUIET || self.since_commit >= COMMIT_MAX);
 
-        changed || self.scroll > 0.0 || due || pen_work
+        changed || sliding || due || pen_work
     }
 
     /// Should the caller commit this frame?
     pub fn commit_due(&self) -> bool {
         !self.committed
-            && (self.page_replaced
-                || self.quiet >= COMMIT_QUIET
-                || (self.since_commit >= COMMIT_MAX && self.scroll <= 0.0))
+            && (self.page_replaced || self.quiet >= COMMIT_QUIET || self.since_commit >= COMMIT_MAX)
     }
 
     /// Write the settled image, replacing the stored one wholesale.
@@ -769,17 +784,22 @@ impl Terminal {
     /// A page replacement is not that at all: see `commit_to`, which erases the
     /// transient glow with the stored image so the page before it cannot shine
     /// through the new one.
+    ///
+    /// A *scroll* is neither: it moves the committed image up the face, which is
+    /// done here because this is where the tube is.  The record is synced to the
+    /// moved page, so the pen has nothing to trace and the lines that scrolled in
+    /// are stamped with the rest rather than written out one glyph at a time; the
+    /// glow is not erased, so the trail travels up with the page it belongs to.
     pub fn commit(&mut self, tube: &mut Tube) {
-        let traced = self.write_rate.is_some() && !self.page_replaced;
-        commit_to(
-            tube,
-            &self.screen,
-            &mut self.pen,
-            self.cols,
-            self.rows,
-            traced,
-            self.scroll,
-        );
+        let mut traced = self.write_rate.is_some() && !self.page_replaced;
+        if self.pending_scroll > 0 {
+            let ch = (tube.h / self.rows.max(1) as i32).max(1);
+            tube.shift_rows(self.pending_scroll as i32 * ch);
+            self.pen.sync(&self.screen);
+            self.pending_scroll = 0;
+            traced = true;
+        }
+        commit_to(tube, &self.screen, &mut self.pen, self.cols, self.rows, traced);
         self.page_replaced = false;
         self.committed = true;
         self.commits += 1;
@@ -789,35 +809,24 @@ impl Terminal {
     /// Draw the current screen into the transient population, leaving the
     /// previous frames to decay underneath: the smear.
     pub fn render(&mut self, tube: &mut Tube, dt: f32) {
+        // where the slide has got to: the image is shown displaced down the face
+        // until it has climbed into place
+        let ch = (tube.h / self.rows.max(1) as i32).max(1);
+        tube.render_offset = (self.slide * ch as f32).round() as i32;
         match self.write_rate {
             Some(rate) => {
                 // the pen traces only what changed, so a typed letter is drawn
-                // as one letter while a scroll is drawn as a whole page
+                // as one letter while a scroll moves the page
                 self.pen
                     .advance(rate * dt, &self.screen, tube, self.cols, self.rows);
-                draw_cursor(
-                    &self.screen,
-                    self.scroll,
-                    self.cols,
-                    self.rows,
-                    tube,
-                    Write::Flash,
-                );
+                draw_cursor(&self.screen, self.cols, self.rows, tube, Write::Flash);
             }
             None => self.stroke_screen(tube, Write::Flash, true),
         }
     }
 
     fn stroke_screen(&mut self, tube: &mut Tube, write: Write, cursor: bool) {
-        stroke_screen(
-            &self.screen,
-            self.scroll,
-            self.cols,
-            self.rows,
-            tube,
-            write,
-            cursor,
-        );
+        stroke_screen(&self.screen, self.cols, self.rows, tube, write, cursor);
     }
 
     /// Change the page size and tell the shell.  The tube follows the window,
@@ -846,7 +855,8 @@ impl Terminal {
         });
         // the committed image was for the old geometry
         self.committed = false;
-        self.scroll = 0.0;
+        self.slide = 0.0;
+        self.pending_scroll = 0;
     }
 
     pub fn stop(&mut self) {
@@ -861,7 +871,6 @@ impl Terminal {
 /// without a pseudoconsole, which is the only way to test it here.
 pub fn stroke_screen(
     screen: &vt::Screen,
-    scroll: f32,
     cols: usize,
     rows: usize,
     tube: &mut Tube,
@@ -876,9 +885,9 @@ pub fn stroke_screen(
         write,
     };
     for r in 0..rows {
-        // screen row 0 is the top; the tube's origin is bottom left, and the
-        // smooth scroll offset shifts everything down as it decays to zero
-        let y = tube.h - ch - ((r as f32 + scroll) * ch as f32).round() as i32;
+        // screen row 0 is the top and the tube's origin is bottom left; a scroll
+        // moves the image itself, so nothing here needs an offset
+        let y = tube.h - ch - (r as f32 * ch as f32).round() as i32;
         if y + ch < 0 || y > tube.h {
             continue;
         }
@@ -901,7 +910,7 @@ pub fn stroke_screen(
         }
     }
     if cursor {
-        draw_cursor(screen, scroll, cols, rows, tube, write);
+        draw_cursor(screen, cols, rows, tube, write);
     }
 }
 
@@ -924,7 +933,6 @@ pub fn commit_to(
     cols: usize,
     rows: usize,
     traced: bool,
-    scroll: f32,
 ) {
     if traced {
         tube.clear_stored();
@@ -933,7 +941,7 @@ pub fn commit_to(
         // no pen at all, or a page replacement: the whole page in one go, and
         // nothing of the page before it
         tube.erase();
-        stroke_screen(screen, scroll, cols, rows, tube, Write::Settle, false);
+        stroke_screen(screen, cols, rows, tube, Write::Settle, false);
     }
 }
 
@@ -941,7 +949,6 @@ pub fn commit_to(
 /// *is* the beam position, so it is never committed.
 pub fn draw_cursor(
     screen: &vt::Screen,
-    scroll: f32,
     cols: usize,
     rows: usize,
     tube: &mut Tube,
@@ -959,7 +966,7 @@ pub fn draw_cursor(
     };
     let cx = screen.cx.min(cols - 1);
     let cy = screen.cy.min(rows - 1);
-    let y = tube.h - ch - ((cy as f32 + scroll) * ch as f32).round() as i32;
+    let y = tube.h - ch - (cy as f32 * ch as f32).round() as i32;
     tube.line(
         cx as i32 * cw + 2,
         y + 2,
@@ -1176,7 +1183,7 @@ mod tests {
 
         // transient: nothing is stored, and the flash decays away
         let mut tube = Tube::new(1024, 780);
-        stroke_screen(&screen, 0.0, 20, 4, &mut tube, Write::Flash, false);
+        stroke_screen(&screen, 20, 4, &mut tube, Write::Flash, false);
         // stats() is (mean light, fraction of the target carrying stored
         // charge); the second is the one that says whether anything stored
         let (_, stored) = tube.stats();
@@ -1201,7 +1208,7 @@ mod tests {
         // settled: the same screen committed does store, and survives any wait
         let mut tube = Tube::new(1024, 780);
         tube.clear_stored();
-        stroke_screen(&screen, 0.0, 20, 4, &mut tube, Write::Settle, false);
+        stroke_screen(&screen, 20, 4, &mut tube, Write::Settle, false);
         let (_, stored) = tube.stats();
         assert!(stored > 0.0, "a settle write must store charge");
         tube.decay(600.0);
@@ -1221,9 +1228,9 @@ mod tests {
 
         let mut tube = Tube::new(1024, 780);
         tube.clear_stored();
-        stroke_screen(&a, 0.0, 20, 4, &mut tube, Write::Settle, false);
+        stroke_screen(&a, 20, 4, &mut tube, Write::Settle, false);
         tube.clear_stored();
-        stroke_screen(&b, 0.0, 20, 4, &mut tube, Write::Settle, false);
+        stroke_screen(&b, 20, 4, &mut tube, Write::Settle, false);
         tube.decay(600.0);
         tube.render_into(&mut buf, 1, 1);
         // a cell is 1024/20 wide and the first row of a 4 row page sits about a
@@ -1316,8 +1323,28 @@ mod tests {
         );
     }
 
+    /// Per screen row, is there any ink?  The same band test as the lit-pixel
+    /// checks above, one band per screen row.
+    fn row_ink(tube: &mut Tube, rows: usize) -> Vec<bool> {
+        let (w, h) = (tube.w, tube.h);
+        let mut buf = Vec::new();
+        tube.render_into(&mut buf, 1, 1);
+        let ch = (h / rows as i32).max(1);
+        (0..rows)
+            .map(|r| {
+                (r as i32 * ch..(r as i32 + 1) * ch).any(|y| {
+                    (0..w).any(|x| ((buf[(y * w + x) as usize] >> 8) & 0xff) > 140)
+                })
+            })
+            .collect()
+    }
+
+    /// A scroll *moves* the committed image: the rows that scrolled off are gone,
+    /// the rest travel up together, and the line that scrolled in arrives at the
+    /// bottom.  Nothing is retraced - which is what makes a listing that scrolls
+    /// cost one page-wide settle instead of minutes of beam time.
     #[test]
-    fn a_scroll_replaces_the_page_instead_of_being_retraced() {
+    fn a_scroll_moves_the_image_up_instead_of_being_retraced() {
         let mut screen = vt::Screen::new(40, 6);
         let mut parser = vt::Parser::new();
         parser.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix", &mut screen);
@@ -1329,35 +1356,38 @@ mod tests {
             guard += 1;
         }
         assert!(!pen.busy(&screen), "the first page must be drawn");
-        assert!(
-            !screen.take_page_reset(),
-            "writing new lines is not a page reset"
-        );
+        pen.settle_drawn(&mut tube, &screen, 40, 6);
+        tube.decay(600.0);
+        let before = row_ink(&mut tube, 6);
+        assert!(before[0] && before[5], "six lines fill the page: {before:?}");
 
-        // one more line: the page scrolls and every row now holds other text
+        // one more line scrolls the page, and the screen says how far
         parser.feed(b"\r\nseven", &mut screen);
-        assert!(screen.take_page_reset(), "a scroll is a page reset");
+        assert_eq!(screen.take_page_change(), PageChange::Scroll(1));
 
-        // so the page is replaced: the record is synced and the commit settles it
-        // whole, which leaves the beam nothing to do.  Retracing instead - which
-        // is what happened before - draws every line a second time over the image
-        // the commits had already stored.
+        // what the commit does with that: move the image, sync the record so
+        // nothing is retraced, and settle the moved page in one go
+        let ch = (tube.h / 6).max(1);
+        tube.shift_rows(ch);
         pen.sync(&screen);
         assert!(
             !pen.busy(&screen),
-            "a replaced page leaves the beam nothing to trace"
+            "a moved page leaves the beam nothing to trace"
         );
         tube.clear_stored();
         pen.settle_drawn(&mut tube, &screen, 40, 6);
         tube.decay(600.0);
-        let mut buf = Vec::new();
-        tube.render_into(&mut buf, 1, 1);
-        let lit = (0..1024)
-            .flat_map(|x| (0..780).map(move |y| (x, y)))
-            .map(|(x, y)| (buf[(y * 1024 + x) as usize] >> 8) & 0xff)
-            .max()
-            .unwrap_or(0);
-        assert!(lit > 140, "the replaced page must be stored, got {lit}");
+
+        let after = row_ink(&mut tube, 6);
+        for r in 0..5 {
+            assert_eq!(
+                after[r],
+                before[r + 1],
+                "row {r} should hold what was on row {}",
+                r + 1
+            );
+        }
+        assert!(after[5], "the line that scrolled in must be there: {after:?}");
     }
 
     /// A page replacement takes the previous page's *glow* with it, not just its
@@ -1378,7 +1408,7 @@ mod tests {
 
         // the page the shell has written, and the erased tail of the command
         // line it has just taken away - which is in the transient population only
-        stroke_screen(&screen, 0.0, 74, 18, &mut tube, Write::Settle, false);
+        stroke_screen(&screen, 74, 18, &mut tube, Write::Settle, false);
         let flash = Style {
             line: LineStyle::Solid,
             defocus: false,
@@ -1392,7 +1422,7 @@ mod tests {
 
         // a clear of the display (or a scroll) is a page replacement
         parser.feed(b"\x1b[2J", &mut screen);
-        commit_to(&mut tube, &screen, &mut pen, 74, 18, false, 0.0);
+        commit_to(&mut tube, &screen, &mut pen, 74, 18, false);
         assert_eq!(
             glow_pixels(&mut tube),
             0,
@@ -1541,7 +1571,7 @@ mod tests {
         let mut parser = vt::Parser::new();
         parser.feed(b"hello\r\nworld", &mut screen);
         tube.clear_stored();
-        stroke_screen(&screen, 0.0, 74, 35, &mut tube, Write::Settle, false);
+        stroke_screen(&screen, 74, 35, &mut tube, Write::Settle, false);
         let mut buf = Vec::new();
         tube.render_into(&mut buf, 1, 1);
         let green = |x: i32, y: i32| (buf[(y * 1024 + x) as usize] >> 8) & 0xff;
