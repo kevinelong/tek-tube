@@ -239,21 +239,25 @@ the window by the monitor's scale factor - on a 150 % display the same buffer is
 bilinearly blown up to 1536x1170 before it is shown - which turns the strokes
 and every speck of phosphor grain into fog.  A settled target is not recomposed
 at all, so an idle screen costs nothing and runs at the display's rate; while a
-file is being drawn, one frame costs about 38 ms at 1024x780: 11 ms scanning the
-target, 17 ms halation and 11 ms colour.
+file is being drawn, one frame costs about 16 ms at 1024x780 in a release build
+and about 71 ms in the debug one.
 
 Everything except the target scan scales with the *output* pixels, so a finer
-window is proportionally slower:
+window is proportionally slower.  Measured through `render_into` on 2026-10-03,
+flood field warm, best of five, the same code both ways:
 
-| `--shrink` | window | per frame | |
+| `--shrink` | window | release | debug |
 |---|---|---|---|
-| 4 (default) | 1024x780 | 38 ms | 26 fps live |
-| 2 | 2048x1560 | 164 ms | 6 fps, a slideshow |
-| 1 | 4096x3120 | 974 ms | stills only |
+| 4 (default) | 1024x780 | 16.0 ms | 71.4 ms |
+| 2 | 2048x1560 | 32.1 ms | 191.4 ms |
+| 1 | 4096x3120 | 114.3 ms | 708.0 ms |
 
-`--shrink 2` and `--shrink 1` are therefore for `--png`/`--png-seq` output, not
-for a live window: the live window is sharp because it is pixel exact, not
-because it is large.
+The 38 / 164 / 974 ms this table carried before 2026-10-03 could not be
+reproduced in either profile here, so they are replaced rather than relabelled.
+
+`--shrink 2` and `--shrink 1` are still for `--png`/`--png-seq` output rather
+than for a live window - the live window is sharp because it is pixel exact, not
+because it is large - but in release `--shrink 2` is no longer a slideshow.
 
 **Fullscreen is the default** - borderless (`WS_POPUP`, no caption, no frame) -
 and **F11 toggles it** while running; `--windowed` starts in a titled frame
@@ -414,22 +418,44 @@ half that was 28% of the frame.
 
 Measured on the running terminal - debug build, 1024x780, from the exit summary -
 173 frames at **51.4 ms each, 19 fps while drawing**: against 89.6 ms windowed
-before the vertical split and 245.7 ms before any of it.
+before the vertical split and 245.7 ms before any of it.  The same windowed
+summary in the release build on 2026-10-03: **46 frames at 17.3 ms each, 58 fps
+while drawing**, three times the debug rate and in the profile this work was for.
 
-**Tried, measured and reverted: blocking the vertical pass.**  The step that
-follows from the memory story is to stop walking a row-major buffer with a stride
-at all - give each thread a *run* of columns, rows outer, so every cache line is
-consumed whole.  It was implemented, blocked 16 columns by 32 rows, and measured:
-**77.7 ms a frame against 49.4 ms**, a 57% *regression*.  In this profile the
+**Tried, measured and rejected twice: blocking the vertical pass.**  The step
+that follows from the memory story is to stop walking a row-major buffer with a
+stride at all - give each thread a *run* of columns, rows outer, so every cache
+line is consumed whole.  First measured in the debug build: blocked 16 columns by
+32 rows, **77.7 ms a frame against 49.4 ms**, a 57% *regression*, because the
 per-element cost of the blocked loops (array indexing, iterator machinery) dwarfs
-the cache effect they buy; in a release build the balance is very likely the other
-way, and a release build is the one thing this machine will not produce.  So the
-change could not be verified in the profile where it would pay, and it was
-reverted rather than shipped unverified.  The analysis stands: this is the first
-thing to try if a release build ever appears.  The release profile is
-where this matters, and the same code is an order of magnitude cheaper there.  A
-release build cannot be produced on this machine at the moment: Smart App Control
-refused nineteen fresh hashes in a row (see the note at the end).
+the cache effect they buy.  The reading at the time was that a release build
+would show the opposite, and a release build was exactly what this machine would
+not produce.
+
+It can now (see the note at the end), and the prediction does not hold.  The same
+idea, rebuilt and measured 2026-10-03, bit for bit the same output at every
+setting, tile widths of 8, 16, 32 and 64 columns, at the real render's grid sizes
+and radii:
+
+| halation grid | split | blocked, best tile | |
+|---|---|---|---|
+| 512x390 (terminal 1024x780) | 3.38 ms | 3.33 ms (16) | 1.01x |
+| 683x520 (plot `--shrink 3`) | 3.56 ms | 3.59 ms (64) | 0.99x |
+| 1280x720 (terminal 2560x1440) | 5.01 ms | 5.06 ms (16) | 0.99x |
+
+and the whole frame through `render_into`, split against blocked at `--shrink`
+4 / 2 / 1: **15.97 / 32.08 / 114.25 ms against 16.25 / 33.44 / 110.92 ms**.  No
+tile width wins anywhere, and the one number that favours blocking is 3%, at the
+one shape that is stills-only.  The debug build loses with the same code by the
+same margin as the original attempt (0.74x to 0.80x), so what fails is the idea,
+not one implementation of it.
+
+Why the paper analysis does not bite: the walk's read amplification is real, but
+the halation grid is 3.7 MB at 1280x720 and 12.8 MB at 2048x1560, and this
+machine's last level cache is 36 MB, so the stride mostly hits L3 rather than the
+memory system the argument was about.  The change is not shipped, and the
+question is closed: this is no longer "the first thing to try if a release build
+ever appears".
 
 The terminal's exit summary reports the frame rate it actually achieved, so "is it
 smooth" is a measurement rather than an impression.
@@ -531,10 +557,12 @@ steps visibly at any window's frame rate.
   repaints every cell would otherwise smear into mud.
 
 The stroke font is ASCII, so a character the font has no glyph for draws as
-`?` rather than silently vanishing.  On this machine the *release* build is
-subject to the Smart App Control lottery described below - and because the
-debug build renders about four times slower, the trail decays about four times
-slower in wall clock terms too, which makes it look heavier than it is.
+`?` rather than silently vanishing.  Until 2026-10-02 the *release* build on this
+machine was subject to the Smart App Control lottery described below; Smart App
+Control is now off and a release build runs, so the trail can be judged in the
+profile it was tuned for.  (The debug build renders about four times slower, and
+its trail therefore decays about four times slower in wall clock terms, which
+makes it look heavier than it is.)
 
 Useful verification flags:
 
@@ -606,9 +634,13 @@ demo), `13_bugss14.plt`, `bugss45.plt` (montages), `09_wizard.plt` (the Tek
 wizard), `07_usmap.plt`, `test.plt` (bar chart), `animation.plt`,
 `spock.plt` (4014 grayscale point plot).
 
-## Environment note: the release binary is blocked by Smart App Control
+## Environment note: Smart App Control (release binaries were blocked until 2026-10-02)
 
-On this machine a freshly built release binary is refused with `os error 4551`
+**Resolved: Smart App Control was turned off on 2026-10-02 and release builds
+now run; the section below is kept as the record of what the block was and what
+the retry loop cost.**  See the resolution at the end.
+
+On this machine a freshly built release binary *was* refused with `os error 4551`
 ("An Application Control policy has blocked this file").  It is not a bug in the
 program and it is not something a local code-signing trick can fix.  Diagnosed:
 
@@ -640,12 +672,13 @@ program and it is not something a local code-signing trick can fix.  Diagnosed:
 
 What actually changes the outcome:
 
-* **Turn Smart App Control off** (Windows Security, requires elevation).  Free
-  and definite, but it is a machine-wide security change and Microsoft's docs
-  disagree on whether it can be turned back on: the consumer FAQ now says yes,
-  the developer doc still calls Off a one-way operation, and this machine
-  carries the registry marker that gates re-enabling.  Look at whether the
-  Settings page offers Evaluation/On/Off as free choices before committing.
+* **Turn Smart App Control off** (Windows Security, requires elevation) - the
+  route taken here on 2026-10-02.  Free and definite, but it is a machine-wide
+  security change and Microsoft's docs disagree on whether it can be turned back
+  on: the consumer FAQ now says yes, the developer doc still calls Off a one-way
+  operation, and this machine carries the registry marker that gates
+  re-enabling.  The Settings page did offer the choice, and the state change
+  survived the restart (see the resolution below).
 * **Sign every build with a certificate from a CA in the Microsoft Trusted Root
   Program** (Azure Artifact Signing from about $10/month, or a conventional
   OV/EV certificate, with an RFC3161 timestamp so an expired signature does not
@@ -660,5 +693,24 @@ What actually changes the outcome:
   decision, not an antivirus one) and neither can an AppLocker rule (AppLocker
   is not the enforcing mechanism).
 
-The debug build and the test binaries are never affected, so `cargo build` and
-`cargo test` always work; only the release binary is at the mercy of this.
+The debug build and the test binaries were never affected, so `cargo build` and
+`cargo test` always worked; only the release binary was at the mercy of this.
+
+### Resolution, 2026-10-02
+
+Smart App Control was turned off (Windows Security, elevation required) and the
+machine restarted.  The registry now reads `VerifiedAndReputablePolicyState = 0`
+under `HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy`, with `SAC_PreviousState
+= 1` and `SAC_EnforcementReason = 6`, and
+`VerifiedAndReputablePolicyStateMinValueSeen` under `...\CI\Protected` has fallen
+from 1 to 0.  Since that boot the CodeIntegrity log holds no event 3077 at all -
+nothing has been refused, only the periodic 3089/3033 policy heartbeats - and a
+freshly built release binary runs: `cargo build --release`, a headless `--png`
+render of `samples/isco10.plt`, a live `--shell` session, and `cargo test
+--release` all work.  The nineteen-in-a-row refusals above are therefore the
+recorded cost of the lottery, not a lasting property of the machine.
+
+Nothing has been tested back the other way.  Microsoft's consumer FAQ says Smart
+App Control can be turned on again, the developer doc still calls Off a one-way
+operation, and this machine carries the marker that gates re-enabling; treat it
+as one-way in practice.
