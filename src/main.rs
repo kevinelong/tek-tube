@@ -1237,6 +1237,196 @@ mod harness {
             .expect("TEK_ARGS asked for --help, so there is nothing to run");
         run(opts).expect("the terminal should run");
     }
+
+    /// "1280x720" -> (1280, 720), or the given default.
+    fn size_of(s: &str, dw: usize, dh: usize) -> (usize, usize) {
+        match s.split_once('x') {
+            Some((a, b)) => match (a.trim().parse(), b.trim().parse()) {
+                (Ok(w), Ok(h)) => (w, h),
+                _ => (dw, dh),
+            },
+            None => (dw, dh),
+        }
+    }
+
+    fn env_f32(key: &str, default: f32) -> f32 {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Lit pixels in the rendered frame: the threshold the tube's own tests use.
+    fn lit(tube: &mut Tube) -> usize {
+        let mut buf = Vec::new();
+        tube.render_into(&mut buf, 1, 1);
+        buf.iter().filter(|p| ((**p >> 8) & 0xff) > 120).count()
+    }
+
+    /// Drive a real shell through the terminal's own frame loop with **no window
+    /// at all**, so what the terminal does can be measured and photographed from
+    /// a script instead of by eye and by hand.
+    ///
+    /// Every option is parsed by the program's own parser, so anything the real
+    /// program can be asked for, this can be asked for the same way:
+    ///
+    /// ```sh
+    /// TEK_ARGS="--ghost 0.1 --write-rate 0" TEK_SCRIPT="dir;cls" \
+    ///   cargo test --release -- --ignored --nocapture terminal_loop
+    /// ```
+    ///
+    /// Environment:
+    ///   TEK_ARGS     the program's own options (a shell is added if none is named)
+    ///   TEK_SCRIPT   commands to type, separated by ';' (default: none)
+    ///   TEK_WAIT     seconds to run after each command (default 2)
+    ///   TEK_SECONDS  seconds to run after the script has been typed (default 6)
+    ///   TEK_SIZE     the tube, WxH (default 1280x720)
+    ///   TEK_PAGE     the shell's page, COLSxROWS (default: the cell scale's page)
+    ///   TEK_PNG      write the last frame to this path
+    ///   TEK_SEQ      write every frame after the script to PREFIX_%04d.png
+    ///   TEK_SEQ_MAX  frames to write for TEK_SEQ (default 120)
+    ///   TEK_TRACE    set to print a line a frame: lit pixels and commits
+    ///
+    /// This exists because the terminal's defects live in the *live* path - a
+    /// doubled Enter from the window's key handling, a glow that outlived its
+    /// erase - and both were found by a throwaway version of this driver after
+    /// they had survived sessions of reading the code.  It is kept for that.
+    #[test]
+    #[ignore = "spawns a real shell and runs unattended; run it deliberately"]
+    fn terminal_loop() {
+        use minifb::Key;
+        let (tw, th) = size_of(
+            &std::env::var("TEK_SIZE").unwrap_or_else(|_| "1280x720".into()),
+            1280,
+            720,
+        );
+        let extra: Vec<String> = std::env::var("TEK_ARGS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let mut argv: Vec<String> = vec!["tek-tube".to_string()];
+        argv.extend(extra.iter().cloned());
+        let named = matches!(
+            parse_args_from(extra.clone().into_iter()).expect("TEK_ARGS should parse"),
+            Some(o) if o.shell.is_some() || o.vt_replay.is_some() || !o.files.is_empty()
+        );
+        if !named {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+            argv.push("--shell".to_string());
+            argv.push(format!(
+                "{root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+            ));
+        }
+        let opts = parse_args_from(argv.into_iter().skip(1))
+            .expect("TEK_ARGS should parse")
+            .expect("TEK_ARGS asked for --help, so there is nothing to run");
+        let shell = opts.shell.clone().expect("the driver needs a shell");
+        let (cols, rows) = match std::env::var("TEK_PAGE") {
+            Ok(v) => size_of(&v, 80, 24),
+            Err(_) => terminal::page(opts.cell.unwrap_or(terminal::CELL_SCALE_DEFAULT)),
+        };
+        let mut tube = Tube::new(tw as i32, th as i32);
+        let cell = terminal::cell_scale_of(tube.w, cols);
+        configure_terminal_tube(&mut tube, opts.device, &opts, cell);
+        let mut term =
+            terminal::Terminal::spawn(&shell, cols, rows).expect("the shell should spawn");
+        if let Some(rate) = opts.write_rate {
+            term.set_write_rate(rate);
+        }
+        if let Some(rate) = opts.slide {
+            term.set_slide_rate(rate);
+        }
+        let mut cb = term.input_handler();
+        let mut last = Instant::now();
+        let (mut frames, mut ms) = (0usize, 0f64);
+        let mut buf: Vec<u32> = Vec::new();
+
+        macro_rules! frame {
+            () => {{
+                let now = Instant::now();
+                let dt = (now - last).as_secs_f32().min(0.25);
+                last = now;
+                let t0 = Instant::now();
+                let changed = term.poll(dt);
+                // the per-frame work `run_shell` does, in the same order
+                tube.fresh_tau = if term.in_alt_screen() {
+                    0.25
+                } else {
+                    opts.trail.unwrap_or(1.1)
+                };
+                tube.decay(dt);
+                if term.commit_due() {
+                    term.commit(&mut tube);
+                }
+                if changed {
+                    term.render(&mut tube, dt);
+                }
+                ms += t0.elapsed().as_secs_f64() * 1e3;
+                frames += 1;
+                std::thread::sleep(std::time::Duration::from_millis(4));
+            }};
+        }
+        macro_rules! pump {
+            ($secs:expr) => {{
+                let until = Instant::now() + std::time::Duration::from_secs_f32($secs);
+                while Instant::now() < until {
+                    frame!();
+                }
+            }};
+        }
+
+        pump!(1.5); // let the shell come up
+        let script = std::env::var("TEK_SCRIPT").unwrap_or_default();
+        let wait = env_f32("TEK_WAIT", 2.0);
+        for cmd in script.split(';').map(str::trim).filter(|c| !c.is_empty()) {
+            for c in cmd.chars() {
+                cb.add_char(c as u32);
+                std::thread::sleep(std::time::Duration::from_millis(6));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            cb.set_key_state(Key::Enter, true);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cb.set_key_state(Key::Enter, false);
+            pump!(wait);
+        }
+
+        let seq = std::env::var("TEK_SEQ").ok();
+        let seq_max = env_f32("TEK_SEQ_MAX", 120.0) as usize;
+        let trace = std::env::var("TEK_TRACE").is_ok();
+        let until = Instant::now() + std::time::Duration::from_secs_f32(env_f32("TEK_SECONDS", 6.0));
+        let mut n = 0usize;
+        while Instant::now() < until {
+            frame!();
+            if trace {
+                println!(
+                    "TLOG frames={frames} lit={} commits={} bytes={}",
+                    lit(&mut tube),
+                    term.commits,
+                    term.bytes_in
+                );
+            }
+            if let (Some(prefix), true) = (&seq, n < seq_max) {
+                tube.render_into(&mut buf, 1, 1);
+                let path = PathBuf::from(format!("{prefix}_{n:04}.png"));
+                write_png(&path, &buf, tube.w as usize, tube.h as usize).expect("png");
+                n += 1;
+            }
+        }
+
+        tube.render_into(&mut buf, 1, 1);
+        if let Ok(path) = std::env::var("TEK_PNG") {
+            write_png(&PathBuf::from(&path), &buf, tube.w as usize, tube.h as usize).expect("png");
+        }
+        println!(
+            "TLOG done: {frames} frames, {:.1} ms a frame, {} commits, {} bytes read, lit {}",
+            ms / frames.max(1) as f64,
+            term.commits,
+            term.bytes_in,
+            lit(&mut tube)
+        );
+        term.stop();
+    }
 }
 
 fn parse_args() -> Result<Option<Options>, Box<dyn Error>> {
