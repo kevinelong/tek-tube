@@ -381,8 +381,9 @@ impl Tube {
         self.under.iter_mut().for_each(|v| *v = 0.0);
         self.fresh_scale = 1.0;
         self.under_scale = 1.0;
-        self.ghost.clear();
-        self.ghost_scale = 0.0;
+        // The ghost is light that has already left the phosphor, and erasing the
+        // charge does not switch it off - it fades on its own.  That is why a
+        // raster terminal's page still glows for a moment after a clear.
     }
 
     /// Keep the image that is on the tube now as a fading ghost.

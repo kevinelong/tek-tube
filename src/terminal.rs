@@ -452,6 +452,8 @@ pub struct Terminal {
     /// scroll the committed image has not been moved for yet.
     slide: f32,
     pending_scroll: usize,
+    /// Rows a second the slide runs at.  Zero makes a scroll jump.
+    slide_rate: f32,
     /// The writing pen, used only when a write rate is set.
     pen: Pen,
     /// Target dots per second the pen draws at; None writes instantly.
@@ -559,6 +561,7 @@ impl Terminal {
             committed: false,
             slide: 0.0,
             pending_scroll: 0,
+            slide_rate: SLIDE_RATE,
             ctrl: false,
             alt: false,
             shift: false,
@@ -598,6 +601,13 @@ impl Terminal {
     /// screen is written instantly, as it always was.
     pub fn set_write_rate(&mut self, dots: f32) {
         self.write_rate = if dots > 0.0 { Some(dots) } else { None };
+    }
+
+    /// Rows a second the display slides a scroll at.  Zero makes a scroll jump,
+    /// which is what a raster terminal does: its screen is static between writes
+    /// and the movement the eye reads is the residual image, not the redraw.
+    pub fn set_slide_rate(&mut self, rows_per_second: f32) {
+        self.slide_rate = rows_per_second.max(0.0);
     }
 
     /// F11 was pressed.  Taken rather than read, so one press toggles once.
@@ -742,10 +752,16 @@ impl Terminal {
         }
 
         // the slide decays toward zero: rows per second, so a long scroll is a
-        // quick slide rather than a jump
+        // quick slide rather than a jump - and a rate of zero makes it a jump,
+        // which is what a raster terminal does, since its movement is only ever
+        // the residual image
         let was_sliding = self.slide > 0.0;
         if was_sliding {
-            self.slide = (self.slide - SLIDE_RATE * dt).max(0.0);
+            self.slide = if self.slide_rate <= 0.0 {
+                0.0
+            } else {
+                (self.slide - self.slide_rate * dt).max(0.0)
+            };
         }
         let sliding = was_sliding || self.slide > 0.0;
 
@@ -801,6 +817,11 @@ impl Terminal {
             self.pen.sync(&self.screen);
             self.pending_scroll = 0;
             traced = true;
+        } else if self.page_replaced {
+            // A clear leaves its light as well: blanking a cell does not switch
+            // off the phosphor that was in it, which is why a raster terminal's
+            // page still glows for a moment after it has been wiped.
+            tube.capture_ghost();
         }
         commit_to(tube, &self.screen, &mut self.pen, self.cols, self.rows, traced);
         self.page_replaced = false;
@@ -1446,6 +1467,27 @@ mod tests {
             page_only,
             "a storage tube's charge does not fade, so nothing is captured"
         );
+    }
+
+    /// An erase takes the charge and leaves the light: blanking a cell does not
+    /// switch off the phosphor that was in it, which is why a page still shows
+    /// through for a moment after a raster terminal has wiped it.
+    #[test]
+    fn an_erase_takes_the_charge_and_leaves_the_ghost_light() {
+        let mut tube = Tube::new(1024, 780);
+        tube.ghost_tau = 1.0;
+        let mut screen = vt::Screen::new(40, 6);
+        let mut parser = vt::Parser::new();
+        parser.feed(b"one\r\ntwo", &mut screen);
+        stroke_screen(&screen, 40, 6, &mut tube, Write::Settle, false);
+        tube.capture_ghost();
+        tube.erase();
+        assert!(
+            lit_pixels(&mut tube) > 0,
+            "the light the page left behind is still there"
+        );
+        tube.decay(20.0);
+        assert_eq!(lit_pixels(&mut tube), 0, "and it fades on its own");
     }
 
     /// A page replacement takes the previous page's *glow* with it, not just its

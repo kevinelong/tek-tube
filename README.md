@@ -541,7 +541,14 @@ rather than merging into it - so this one does not ghost on its own.  `--ghost F
 captures the page a scroll replaces as a fading layer for F seconds
 (`Tube::capture_ghost`, decayed like the transients and summed into the light, so
 it haloes like everything else).  Default 0: no ghost, which is what the hardware
-being emulated does.
+being emulated does.  `--slide R` sets the rows a second the display slides a
+scroll at (default 30); `--slide 0` makes a scroll land in one step, which is how
+a raster terminal moves - its screen is static between writes and the movement
+the eye reads is the residual image, not a redraw.  The closest match to that
+Wyse-60 clip is `--ghost 1.0 --slide 0 --write-rate 0`: no beam writer, page
+changes land in one step, and the page before each of them stays lit while it
+fades.  An erase leaves the ghost too, because blanking a cell does not switch
+off the phosphor that was in it.
 
 **The image works the way a storage tube forces it to.**  A storage tube cannot
 erase one character, so content that is still moving is written into the

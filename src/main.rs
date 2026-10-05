@@ -72,6 +72,9 @@ struct Options {
     /// was.  Zero - the default - has no ghost at all, which is what a storage
     /// tube does: its charge does not fade.
     ghost: Option<f32>,
+    /// Terminal mode: rows a second the display slides a scroll at.  Zero makes
+    /// a scroll jump, which is what a raster terminal does.
+    slide: Option<f32>,
     /// Replay a captured terminal byte stream instead of a plot file.  A
     /// diagnostic for the terminal renderer, which is otherwise only reachable
     /// by typing into a window.
@@ -119,6 +122,7 @@ impl Default for Options {
             vt_replay: None,
             write_rate: None,
             ghost: None,
+            slide: None,
             cell: None,
             quiet: false,
         }
@@ -214,6 +218,10 @@ Usage: tek-tube [options] file.plt [more.plt ...]
                             raster terminal's phosphor does and the source of the
                             ghosting real terminals show; a storage tube's charge
                             does not fade, so the default is 0, no ghost
+  --slide R                 terminal mode: rows a second the display slides a
+                            scroll at (default 30).  0 makes a scroll land in one
+                            step, the way a raster terminal's does when the
+                            movement is carried by the residual image instead
   --shell CMD               run a shell under a pseudoconsole and render the
                             session on the tube instead of playing plot files,
                             e.g. --shell powershell.exe.  The page is the
@@ -738,6 +746,9 @@ fn run_shell(command: &str, opts: &Options) -> Result<(), Box<dyn Error>> {
     let mut term = terminal::Terminal::spawn(command, cols, rows)?;
     if let Some(rate) = opts.write_rate {
         term.set_write_rate(rate);
+    }
+    if let Some(rate) = opts.slide {
+        term.set_slide_rate(rate);
     }
     if !opts.quiet {
         println!(
@@ -1292,6 +1303,7 @@ where
             "--vt-replay" => o.vt_replay = Some(PathBuf::from(value("--vt-replay")?)),
             "--write-rate" => o.write_rate = Some(value("--write-rate")?.parse()?),
             "--ghost" => o.ghost = Some(value("--ghost")?.parse()?),
+            "--slide" => o.slide = Some(value("--slide")?.parse()?),
             "--cell" => o.cell = Some(value("--cell")?.parse()?),
             "--no-autoclear" => o.autoclear = false,
             "--no-enhanced" => o.enhanced = false,
