@@ -83,6 +83,10 @@ struct Options {
     /// deep the gaps between scan lines go.  Off by default, because a vector
     /// display has no scan lines at all.
     scan: Option<f32>,
+    /// Paint glyphs as a dot matrix this many dots tall, the way a terminal's
+    /// character ROM is built.  Zero strokes them, which is what a storage
+    /// tube's beam does.
+    dots: Option<usize>,
     /// Replay a captured terminal byte stream instead of a plot file.  A
     /// diagnostic for the terminal renderer, which is otherwise only reachable
     /// by typing into a window.
@@ -133,6 +137,7 @@ impl Default for Options {
             ghost: None,
             slide: None,
             scan: None,
+            dots: None,
             cell: None,
             quiet: false,
         }
@@ -240,6 +245,19 @@ Usage: tek-tube [options] file.plt [more.plt ...]
                             flat face.  A vector display emits no scan lines; a
                             raster one is striped, and that stripe is most of
                             what makes a photograph of one read as a CRT
+  --dots N                  paint glyphs as a dot matrix N dots tall, the way a
+                            terminal's character ROM is built, instead of tracing
+                            the strokes a storage tube writes (0, the default,
+                            traces them; a ROM was about 8 wide by 15 tall).  The
+                            grid is the cell's and the same for every glyph, so
+                            capitals and baselines line up
+  --wyse                    the raster-terminal look in one flag: a black face,
+                            a 15 dot matrix face, the scan's stripes, the page
+                            changed a screenful at a time with the one before it
+                            left glowing, no beam writer, and a 19,200 baud link.
+                            Equivalent to --write-rate 0 --slide 0 --ghost 0.1
+                            --scan 0.5 --dots 15 --ambient 0 --trail 0.2
+                            --baud 19200; a later flag overrides any of them
   --shell CMD               run a shell under a pseudoconsole and render the
                             session on the tube instead of playing plot files,
                             e.g. --shell powershell.exe.  The page is the
@@ -518,6 +536,9 @@ fn configure_tube(tube: &mut Tube, dev: Device, opts: &Options) {
     }
     if let Some(v) = opts.scan {
         tube.phosphor.scan_depth = v.clamp(0.0, 0.95);
+    }
+    if let Some(v) = opts.dots {
+        tube.dot_rows = v;
     }
     tube.phosphor.camera = opts.camera;
     tube.font = font::face(opts.font);
@@ -1529,6 +1550,21 @@ where
             "--ghost" => o.ghost = Some(value("--ghost")?.parse()?),
             "--slide" => o.slide = Some(value("--slide")?.parse()?),
             "--scan" => o.scan = Some(value("--scan")?.parse()?),
+            "--dots" => o.dots = Some(value("--dots")?.parse()?),
+            // The raster-terminal look, in one flag.  Every value here is one
+            // the measurements settled on (see the README), and any of them can
+            // be overridden by a later flag on the same command line.
+            "--wyse" => {
+                o.write_rate = Some(0.0); // no beam writer: the glyphs just appear
+                o.slide = Some(0.0); // a screenful lands in one step
+                o.ghost = Some(0.1); // the page before it, fading
+                o.scan = Some(0.5); // the scan's own stripes
+                o.dots = Some(15); // a ROM-ish dot grid
+                o.ambient = Some(0.0); // a black face, not a lit flood field
+                o.trail = Some(0.2); // a short glow: the residual is the ghost
+                o.baud = 19200.0; // a serial link, not a disk
+                o.baud_given = true;
+            }
             "--cell" => o.cell = Some(value("--cell")?.parse()?),
             "--no-autoclear" => o.autoclear = false,
             "--no-enhanced" => o.enhanced = false,

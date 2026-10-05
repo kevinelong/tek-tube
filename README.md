@@ -567,6 +567,27 @@ already been read into the backlog.  It is unpaced unless given, because plot
 playback has always had a default line speed and a terminal should not silently
 inherit one.
 
+`--dots N` gives the glyphs a character ROM: the same letterforms drawn as filled
+dots on a cell-aligned grid N dots tall, instead of traced strokes (the column
+count follows from keeping the dots square, so the grid is the same shape at any
+cell size).  A stroke face suits this, because its glyphs are one stroke wide by
+construction: sampled onto the grid they are one dot wide, which is what a ROM
+font is.  The spot has to be wider than the pitch or the dots read as a chain of
+beads rather than a solid letter - measured at three quarters of the pitch it
+reads as a terminal, at a bit over a third it reads as knitting.
+
+`--wyse` is all of the above in one flag, at the values the measurements
+settled on: black face, 15 dot face, scan stripes, page-at-a-time changes with
+the old page left glowing, no beam writer, and a 19,200 baud link.  It is exactly
+equivalent to
+
+```sh
+--write-rate 0 --slide 0 --ghost 0.1 --scan 0.5 --dots 15 --ambient 0 --trail 0.2 --baud 19200
+```
+
+and any of those can still be overridden by a later flag on the same command
+line.
+
 **The image works the way a storage tube forces it to.**  A storage tube cannot
 erase one character, so content that is still moving is written into the
 transient population only: it flashes hot and decays, and because each frame

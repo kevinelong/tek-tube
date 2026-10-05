@@ -287,6 +287,16 @@ struct FieldKey {
     ambient: f32,
 }
 
+/// How much of the cell a glyph fills vertically, and how far above the cell's
+/// bottom its baseline sits.  Both the stroked path and the dot matrix path use
+/// these, so the two cannot drift apart.
+const GLYPH_FILL_H: f32 = 0.85;
+const GLYPH_BASELINE: f32 = 0.24;
+
+/// How much of the cell the glyph fills horizontally, and therefore how wide the
+/// gaps between letters are on a fixed pitch.
+const GLYPH_FILL_W: f32 = 0.95;
+
 pub struct Tube {
     pub w: i32,
     pub h: i32,
@@ -340,6 +350,15 @@ pub struct Tube {
     /// headless run can be shown to have taken one.
     pub ghosted_cells: usize,
 
+    /// Paint glyphs as a dot matrix this many dots tall, the way a terminal's
+    /// character ROM is built, rather than traced strokes.  Zero - the default -
+    /// strokes them.  Rows rather than a pitch, so the grid is the same shape
+    /// whatever the cell is: the column count follows from keeping the dots
+    /// square.  A terminal's ROM was 8 wide by 15 tall or so.
+    pub dot_rows: usize,
+    /// The dot grid each glyph lights, by (char, grid width, grid height).
+    raster: std::collections::HashMap<(u8, u32, u32), Vec<bool>>,
+
     /// Scratch for composing a frame (kept to avoid per frame allocation).
     light_buf: Vec<f32>,
     fresh_buf: Vec<f32>,
@@ -378,6 +397,8 @@ impl Tube {
             beam_dots: 0.0,
             fresh_scale: 1.0,
             under_scale: 1.0,
+            dot_rows: 0,
+            raster: std::collections::HashMap::new(),
             render_offset: 0,
             ghost: Vec::new(),
             ghost_scale: 0.0,
@@ -742,11 +763,10 @@ impl Tube {
         // more of the cell brings the letters closer together without breaking
         // the fixed pitch.  A monospaced face has one width for every glyph, so
         // 0.95 leaves a consistent 5% gap.
-        const FILL_H: f32 = 0.85;
-        const FILL_W: f32 = 0.95;
-        let scale = ((cell_h as f32 * FILL_H) / 21.0)
+        const FILL_W: f32 = GLYPH_FILL_W;
+        let scale = ((cell_h as f32 * GLYPH_FILL_H) / 21.0)
             .min(cell_w as f32 * FILL_W / self.font.max_width().max(1.0));
-        let baseline = y + cell_h as f32 * 0.24;
+        let baseline = y + cell_h as f32 * GLYPH_BASELINE;
         // Condense the widest glyphs to the cap, so the width range shrinks and
         // ordinary letters are not spaced out by the widest one.  The centre of
         // the glyph stays put, so the pitch is still exactly one cell.
@@ -776,6 +796,10 @@ impl Tube {
         st: Style,
         energy: f32,
     ) {
+        if self.dot_rows > 0 {
+            self.character_dots(ch, x, y, cell_w, cell_h, st, energy);
+            return;
+        }
         // draws through the same placement helper, so the two cannot drift
         let mut segs: Vec<(f32, f32, f32, f32)> = Vec::new();
         self.glyph_strokes(ch, x, y, cell_w, cell_h, |x0, y0, x1, y1| {
@@ -784,6 +808,92 @@ impl Tube {
         for (x0, y0, x1, y1) in segs {
             self.stroke(x0, y0, x1, y1, st, energy);
         }
+    }
+
+    /// The same glyph, drawn as a dot matrix.
+    ///
+    /// A terminal had a character ROM: a grid of dots, fixed for every glyph, so
+    /// a letter is blocky and uniform rather than a smooth curve.  The
+    /// letterforms here are the stroke face's - it is the *grid* that makes it
+    /// read as a terminal - and a stroke face suits it, because its glyphs are
+    /// one stroke wide by construction: sampled onto the grid they become one
+    /// dot wide, which is exactly what a ROM font is.
+    fn character_dots(
+        &mut self,
+        ch: u8,
+        x: f32,
+        y: f32,
+        cell_w: i32,
+        cell_h: i32,
+        st: Style,
+        energy: f32,
+    ) {
+        let (gw, gh, bits) = self.raster_glyph(ch, x, y, cell_w, cell_h);
+        let baseline = y + cell_h as f32 * GLYPH_BASELINE;
+        let top = baseline + cell_h as f32 * GLYPH_FILL_H;
+        let bottom = baseline - cell_h as f32 * GLYPH_BASELINE;
+        let dx = cell_w as f32 / gw as f32;
+        let dy = (top - bottom) / gh as f32;
+        // A raster pixel is not a hairline: a CRT's spot is wider than the dot
+        // pitch, which is why neighbouring dots merge into a continuous stroke
+        // and a ROM font looks solid rather than beaded.  Three quarters of the
+        // pitch is enough to close the gaps and keep the grid visible.
+        let pitch = (top - bottom) / gh as f32;
+        let sigma = self.sigma;
+        self.sigma = pitch * 0.75;
+        for gy in 0..gh {
+            for gx in 0..gw {
+                if bits[(gy * gw + gx) as usize] {
+                    let cx = x + (gx as f32 + 0.5) * dx;
+                    let cy = top - (gy as f32 + 0.5) * dy;
+                    self.dot(cx.round() as i32, cy.round() as i32, energy, st);
+                }
+            }
+        }
+        self.sigma = sigma;
+    }
+
+    /// Which dots of the cell grid this glyph lights.
+    ///
+    /// The grid is the cell's own - the same for every glyph, so capitals and
+    /// baselines line up - and covers the box a glyph can ink: the baseline's
+    /// descender allowance below it and the cap height above.  Cached per glyph,
+    /// because this is the same work for the same cell every time.
+    fn raster_glyph(&mut self, ch: u8, x: f32, y: f32, cell_w: i32, cell_h: i32) -> (u32, u32, Vec<bool>) {
+        // the grid is the cell's: the rows are what was asked for, and keeping
+        // the dots square sets the columns, so a wide cell simply has more of
+        // them rather than stretched glyphs
+        let gh = self.dot_rows.clamp(5, 32) as u32;
+        let pitch = cell_h as f32 * (GLYPH_FILL_H + GLYPH_BASELINE) / gh as f32;
+        let gw = ((cell_w as f32 / pitch).round() as u32).clamp(3, 24);
+        if let Some(bits) = self.raster.get(&(ch, gw, gh)) {
+            return (gw, gh, bits.clone());
+        }
+        let mut segs: Vec<(f32, f32, f32, f32)> = Vec::new();
+        self.glyph_strokes(ch, x, y, cell_w, cell_h, |x0, y0, x1, y1| {
+            segs.push((x0, y0, x1, y1));
+        });
+        let baseline = y + cell_h as f32 * GLYPH_BASELINE;
+        let top = baseline + cell_h as f32 * GLYPH_FILL_H;
+        let dx = cell_w as f32 / gw as f32;
+        let dy = (top - baseline + cell_h as f32 * GLYPH_BASELINE) / gh as f32;
+        let mut bits = vec![false; (gw * gh) as usize];
+        for (x0, y0, x1, y1) in segs {
+            // walk the stroke a third of a dot at a time: a dot is lit when the
+            // stroke passes through it, which is what makes this a dot matrix
+            let len = ((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)).sqrt();
+            let steps = (len / (pitch * 0.34)).ceil().max(1.0) as usize;
+            for s in 0..=steps {
+                let t = s as f32 / steps as f32;
+                let gx = ((x0 + (x1 - x0) * t - x) / dx).floor();
+                let gy = ((top - (y0 + (y1 - y0) * t)) / dy).floor();
+                if gx >= 0.0 && gy >= 0.0 && (gx as u32) < gw && (gy as u32) < gh {
+                    bits[gy as usize * gw as usize + gx as usize] = true;
+                }
+            }
+        }
+        self.raster.insert((ch, gw, gh), bits.clone());
+        (gw, gh, bits)
     }
 
     /// Flood gun illumination at a point of the target: a slow large scale
@@ -1696,6 +1806,72 @@ mod tests {
         off.ghost_cell(24, 24, 16, 16);
         off.clear_stored();
         assert_eq!(lit(&mut off), 0, "a storage tube keeps nothing");
+    }
+
+    /// The dot matrix draws the same glyph in the same place: the ink box is the
+    /// cell's own box either way, so switching the face does not move the text.
+    #[test]
+    fn the_dot_matrix_puts_the_glyph_where_the_strokes_do() {
+        let cell = |dots: usize| {
+            let mut t = Tube::new(128, 128);
+            t.dot_rows = dots;
+            // so the box measured is the glyph's and nothing else
+            t.phosphor.ambient = 0.0;
+            t.phosphor.mottle = 0.0;
+            t.phosphor.grain = 0.0;
+            t.phosphor.vignette = 0.0;
+            t.phosphor.gradient = 0.0;
+            t.phosphor.speck = 0.0;
+            t.character(
+                b'H',
+                32.0,
+                40.0,
+                64,
+                48,
+                Style {
+                    line: LineStyle::Solid,
+                    defocus: false,
+                    write: Write::Settle,
+                },
+                1.0,
+            );
+            t.decay(600.0);
+            let (w, h) = (t.w as usize, t.h as usize);
+            let mut buf = Vec::new();
+            t.render_into(&mut buf, 1, 1);
+            let (mut x0, mut x1, mut y0, mut y1) = (i32::MAX, -1i32, i32::MAX, -1i32);
+            let mut n = 0usize;
+            for y in 0..h {
+                for x in 0..w {
+                    if ((buf[y * w + x] >> 8) & 0xff) > 100 {
+                        x0 = x0.min(x as i32);
+                        x1 = x1.max(x as i32);
+                        y0 = y0.min(y as i32);
+                        y1 = y1.max(y as i32);
+                        n += 1;
+                    }
+                }
+            }
+            (x0, x1, y0, y1, n)
+        };
+        let (sx0, sx1, sy0, sy1, sn) = cell(0);
+        let (dx0, dx1, dy0, dy1, dn) = cell(15);
+        assert!(sn > 0 && dn > 0, "both paths must draw something");
+        for (a, b, what) in [
+            (sx0, dx0, "left"),
+            (sx1, dx1, "right"),
+            (sy0, dy0, "bottom"),
+            (sy1, dy1, "top"),
+        ] {
+            assert!(
+                (a - b).abs() <= 8,
+                "the dot matrix's {what} edge is at {b}, the strokes' at {a}"
+            );
+        }
+        assert!(
+            dn as f32 > sn as f32 * 0.4 && dn < sn * 4,
+            "the two paths should be comparable in weight: {dn} dots against {sn} stroke pixels"
+        );
     }
 
     #[test]
