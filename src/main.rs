@@ -24,6 +24,10 @@ struct Options {
     files: Vec<PathBuf>,
     device: Device,
     baud: f32,
+    /// Whether `--baud` was actually given.  Plot playback has always had a
+    /// default line speed; terminal mode only paces the link when asked, so the
+    /// two meanings do not collide.
+    baud_given: bool,
     speed: f32,
     glow: f32,
     beam: f32,
@@ -92,6 +96,7 @@ impl Default for Options {
             files: Vec::new(),
             device: Device::Tek4014,
             baud: 19200.0,
+            baud_given: false,
             speed: 1.0,
             glow: 0.45,
             beam: 0.5,
@@ -143,7 +148,10 @@ Usage: tek-tube [options] file.plt [more.plt ...]
   --device 4010|4014        target display (default 4014, whose 4096x3120
                             target is a superset of the 4010's 1024x780)
   --baud N                  serial line speed, characters per second = N/10
-                            (default 19200, 0 = draw as fast as possible)
+                            (default 19200, 0 = draw as fast as possible).  In
+                            terminal mode this paces the *link*: the screen is
+                            fed at that rate, so a listing takes the time a
+                            listing took, and it is unpaced unless given
   --speed F                 multiplier on the drawing rate (default 1.0)
   --glow F                  fresh stroke flash time constant in seconds
                             (default 0.45: strokes come in hot and settle)
@@ -763,6 +771,9 @@ fn run_shell(command: &str, opts: &Options) -> Result<(), Box<dyn Error>> {
     if let Some(rate) = opts.slide {
         term.set_slide_rate(rate);
     }
+    if opts.baud_given {
+        term.set_baud(opts.baud);
+    }
     if !opts.quiet {
         println!(
             "terminal: {command} on a {cols}x{rows} page (cell x{:.2}) of a {}x{} target{}",
@@ -1350,7 +1361,11 @@ mod harness {
         if let Some(rate) = opts.slide {
             term.set_slide_rate(rate);
         }
+        if opts.baud_given {
+            term.set_baud(opts.baud);
+        }
         let mut cb = term.input_handler();
+        let start = Instant::now();
         let mut last = Instant::now();
         let (mut frames, mut ms) = (0usize, 0f64);
         let mut buf: Vec<u32> = Vec::new();
@@ -1413,10 +1428,12 @@ mod harness {
             frame!();
             if trace {
                 println!(
-                    "TLOG frames={frames} lit={} commits={} bytes={}",
+                    "TLOG t={:.2} frames={frames} lit={} commits={} bytes_in={} shown={}",
+                    start.elapsed().as_secs_f32(),
                     lit(&mut tube),
                     term.commits,
-                    term.bytes_in
+                    term.bytes_in,
+                    term.bytes_shown
                 );
             }
             if let (Some(prefix), true) = (&seq, n < seq_max) {
@@ -1468,7 +1485,10 @@ where
                     other => return Err(format!("unknown device {}", other).into()),
                 }
             }
-            "--baud" => o.baud = value("--baud")?.parse()?,
+            "--baud" => {
+                o.baud = value("--baud")?.parse()?;
+                o.baud_given = true;
+            }
             "--speed" => o.speed = value("--speed")?.parse()?,
             "--glow" => o.glow = value("--glow")?.parse()?,
             "--beam" => o.beam = value("--beam")?.parse()?,

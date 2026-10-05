@@ -476,8 +476,17 @@ pub struct Terminal {
     dump: Option<std::fs::File>,
     /// Counters, so a headless run can be shown to have done something.
     pub bytes_in: usize,
+    /// Bytes the link has actually carried to the screen.  Smaller than
+    /// `bytes_in` while `--baud` is pacing, by exactly the backlog.
+    pub bytes_shown: usize,
     pub commits: usize,
     pub keys_in: usize,
+    /// Bytes a second the link carries (`baud`), or `None` for unpaced.
+    baud: Option<f32>,
+    /// Fractional bytes carried between frames, and the part of a chunk the link
+    /// has not carried yet.
+    byte_credit: f32,
+    pending: Vec<u8>,
 }
 
 impl Terminal {
@@ -567,8 +576,12 @@ impl Terminal {
             shift: false,
             eof: false,
             bytes_in: 0,
+            bytes_shown: 0,
             commits: 0,
             keys_in: 0,
+            baud: None,
+            byte_credit: 0.0,
+            pending: Vec::new(),
         })
     }
 
@@ -610,6 +623,13 @@ impl Terminal {
         self.slide_rate = rows_per_second.max(0.0);
     }
 
+    /// Bytes a second the link carries, as a baud rate: 0 or less leaves it
+    /// unpaced, which is what a disk-fed screen looks like.  At 9600 baud a
+    /// listing takes the time a listing took.
+    pub fn set_baud(&mut self, baud: f32) {
+        self.baud = if baud > 0.0 { Some(baud) } else { None };
+    }
+
     /// F11 was pressed.  Taken rather than read, so one press toggles once.
     pub fn take_fullscreen_toggle(&mut self) -> bool {
         std::mem::take(&mut self.toggle_fullscreen)
@@ -642,24 +662,63 @@ impl Terminal {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    /// Feed the parser and answer it.
+    ///
+    /// Split out so the paced path and the unpaced one cannot drift apart: both
+    /// go through here, and both count what the link has actually carried.
+    fn feed_parser(&mut self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        self.bytes_shown += bytes.len();
+        let replies = self.parser.feed(bytes, &mut self.screen);
+        if !replies.is_empty() {
+            let _ = self.writer.write_all(&replies);
+            let _ = self.writer.flush();
+        }
+        true
+    }
+
     /// Read whatever the shell has produced, feed the parser, answer it, and
     /// handle input.  Returns true if the image needs redrawing.
     pub fn poll(&mut self, dt: f32) -> bool {
         let mut new_bytes = false;
-        // drain the pty without blocking
+        // The link.  A serial terminal is paced by its line, so `--baud` can pace
+        // this one: the screen is fed at the line's character rate instead of at
+        // disk speed, and a listing scrolls at a rate that looks like a terminal.
+        // The credit is kept in fractions so a rate slower than the frame rate
+        // still averages out exactly, and a chunk that does not fit waits in
+        // `pending` - the order is preserved, nothing is fed twice, and the wait
+        // is the line's back-pressure.
+        let mut budget = usize::MAX;
+        if let Some(baud) = self.baud {
+            self.byte_credit += baud / 10.0 * dt;
+            let whole = self.byte_credit.floor();
+            self.byte_credit -= whole;
+            budget = whole.max(0.0) as usize;
+        }
+        while budget > 0 && !self.pending.is_empty() {
+            let take = budget.min(self.pending.len());
+            let chunk: Vec<u8> = self.pending.drain(..take).collect();
+            new_bytes |= self.feed_parser(&chunk);
+            budget -= take;
+        }
         loop {
             match self.rows_rx.try_recv() {
                 Ok(chunk) => {
-                    new_bytes = true;
                     self.bytes_in += chunk.len();
+                    // the dump is everything the shell sent, whether or not the
+                    // link has carried it to the screen yet
                     if let Some(f) = self.dump.as_mut() {
                         use std::io::Write;
                         let _ = f.write_all(&chunk);
                     }
-                    let replies = self.parser.feed(&chunk, &mut self.screen);
-                    if !replies.is_empty() {
-                        let _ = self.writer.write_all(&replies);
-                        let _ = self.writer.flush();
+                    let take = budget.min(chunk.len());
+                    new_bytes |= self.feed_parser(&chunk[..take]);
+                    budget -= take;
+                    if take < chunk.len() {
+                        self.pending.extend_from_slice(&chunk[take..]);
+                        break;
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => break,

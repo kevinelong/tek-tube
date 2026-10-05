@@ -559,6 +559,14 @@ display's background is black rather than a lit field, and `--trail` should be
 short (0.2 s), because what a raster terminal leaves behind is the previous
 *page* - which is `--ghost` - not a glow around everything it has just written.
 
+`--baud N` gives the link a speed.  In terminal mode the screen is fed at N/10
+characters a second, so a listing arrives at the rate a serial terminal's did
+instead of at disk speed: measured through the driver, `--baud 9600` took 5,253
+bytes in 5.47 s (exactly 960 a second) while the whole 6,550 byte flood had
+already been read into the backlog.  It is unpaced unless given, because plot
+playback has always had a default line speed and a terminal should not silently
+inherit one.
+
 **The image works the way a storage tube forces it to.**  A storage tube cannot
 erase one character, so content that is still moving is written into the
 transient population only: it flashes hot and decays, and because each frame
