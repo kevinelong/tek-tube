@@ -306,6 +306,117 @@ const GLYPH_BASELINE: f32 = 0.24;
 /// gaps between letters are on a fixed pitch.
 const GLYPH_FILL_W: f32 = 0.95;
 
+/// Line art as cell fractions: `(x0, y0, x1, y1)`, x 0 at the left edge, y 0 at
+/// the cell's bottom, both 1 at the far edge.  Drawing on the edges is the whole
+/// point: a rule that runs 0 to 1 in x joins the rule in the next cell, which a
+/// centred letterform cannot do.
+type Art = &'static [(f32, f32, f32, f32)];
+
+/// The DEC special graphics set, indexed by `byte - 0x5F`.  The entries that
+/// are empty are the ones this face does not draw (the checkerboard, the control
+/// pictures, the pound sign); they render as nothing rather than as a wrong
+/// glyph.
+const ACS_ART: [Art; 32] = [
+    /* _ blank        */ &[],
+    /* ` diamond      */ &[(0.5, 0.35, 0.72, 0.5), (0.72, 0.5, 0.5, 0.65), (0.5, 0.65, 0.28, 0.5), (0.28, 0.5, 0.5, 0.35)],
+    /* a checkerboard */ &[],
+    /* b              */ &[],
+    /* c              */ &[],
+    /* d              */ &[],
+    /* e              */ &[],
+    /* f degree       */ &[(0.36, 0.74, 0.64, 0.74), (0.64, 0.74, 0.64, 0.94), (0.64, 0.94, 0.36, 0.94), (0.36, 0.94, 0.36, 0.74)],
+    /* g plus/minus   */ &[(0.25, 0.78, 0.75, 0.78), (0.5, 0.63, 0.5, 0.93), (0.25, 0.35, 0.75, 0.35)],
+    /* h              */ &[],
+    /* i              */ &[],
+    /* j lower right  */ &[(0.5, 0.5, 0.0, 0.5), (0.5, 0.5, 0.5, 1.0)],
+    /* k upper right  */ &[(0.5, 0.5, 1.0, 0.5), (0.5, 0.5, 0.5, 1.0)],
+    /* l upper left   */ &[(0.5, 0.5, 1.0, 0.5), (0.5, 0.5, 0.5, 0.0)],
+    /* m lower left   */ &[(0.5, 0.5, 0.0, 0.5), (0.5, 0.5, 0.5, 0.0)],
+    /* n cross        */ &[(0.0, 0.5, 1.0, 0.5), (0.5, 0.0, 0.5, 1.0)],
+    /* o scan 1       */ &[(0.0, 0.85, 1.0, 0.85)],
+    /* p scan 3       */ &[(0.0, 0.65, 1.0, 0.65)],
+    /* q horizontal   */ &[(0.0, 0.5, 1.0, 0.5)],
+    /* r scan 7       */ &[(0.0, 0.35, 1.0, 0.35)],
+    /* s scan 9       */ &[(0.0, 0.15, 1.0, 0.15)],
+    /* t left tee     */ &[(0.5, 0.0, 0.5, 1.0), (0.5, 0.5, 1.0, 0.5)],
+    /* u right tee    */ &[(0.5, 0.0, 0.5, 1.0), (0.0, 0.5, 0.5, 0.5)],
+    /* v bottom tee   */ &[(0.0, 0.5, 1.0, 0.5), (0.5, 0.5, 0.5, 1.0)],
+    /* w top tee      */ &[(0.0, 0.5, 1.0, 0.5), (0.5, 0.0, 0.5, 0.5)],
+    /* x vertical     */ &[(0.5, 0.0, 0.5, 1.0)],
+    /* y <=           */ &[(0.75, 0.42, 0.3, 0.56), (0.3, 0.56, 0.75, 0.7), (0.25, 0.24, 0.8, 0.24)],
+    /* z >=           */ &[(0.25, 0.42, 0.7, 0.56), (0.7, 0.56, 0.25, 0.7), (0.2, 0.24, 0.75, 0.24)],
+    /* { pi           */ &[(0.2, 0.68, 0.8, 0.68), (0.35, 0.68, 0.35, 0.32), (0.65, 0.68, 0.65, 0.32)],
+    /* | not equal    */ &[(0.2, 0.4, 0.8, 0.4), (0.2, 0.62, 0.8, 0.62), (0.62, 0.28, 0.38, 0.74)],
+    /* } pound        */ &[],
+    /* ~ middle dot   */ &[(0.5, 0.44, 0.5, 0.56)],
+];
+
+/// The glyph code a screen character is drawn with.
+///
+/// Line art arrives two ways: the special graphics set, which the parser has
+/// already put on `U+0080..=U+009F`, and the Unicode box-drawing characters a
+/// program speaking UTF-8 sends instead.  Both are drawn from the art table.
+/// Anything else that is not ASCII becomes `?`, which is all this face can do
+/// with it - before this, that was everything, so a TUI's frames arrived as a
+/// row of question marks.
+pub fn glyph_code(c: char) -> u8 {
+    if let Some(code) = box_drawing_code(c) {
+        return code;
+    }
+    if (0x80..=0x9f).contains(&(c as u32)) {
+        return c as u8;
+    }
+    if (c as u32) < 127 {
+        c as u8
+    } else {
+        b'?'
+    }
+}
+
+/// The line art a glyph code stands for, if it is one of the special graphics
+/// set.  The parser puts a byte drawn in that set on `0x80..=0x9F`, one code per
+/// entry above, so the code *is* the index.
+fn acs_art(ch: u8) -> Option<Art> {
+    if (0x80..=0x9f).contains(&ch) {
+        Some(ACS_ART[(ch - 0x80) as usize])
+    } else {
+        None
+    }
+}
+
+/// The Unicode box-drawing and symbol characters a program speaking UTF-8 sends,
+/// mapped onto the same codes the special graphics set uses.
+///
+/// Doubled rules are drawn single: this face has no double rule, and a frame
+/// reads as a frame either way.  A UTF-8 program is the common case now - `vim`,
+/// `htop` and `tmux` send these rather than `ESC ( 0` - so this is not a
+/// nicety, it is the half that most terminal output actually uses.
+pub fn box_drawing_code(c: char) -> Option<u8> {
+    let acs = match c {
+        '\u{2500}' | '\u{2501}' | '\u{2550}' => b'q',
+        '\u{2502}' | '\u{2503}' | '\u{2551}' => b'x',
+        '\u{250c}' | '\u{250f}' | '\u{2554}' => b'l',
+        '\u{2510}' | '\u{2513}' | '\u{2557}' => b'k',
+        '\u{2514}' | '\u{2517}' | '\u{255a}' => b'm',
+        '\u{2518}' | '\u{251b}' | '\u{255d}' => b'j',
+        '\u{251c}' | '\u{2523}' | '\u{2560}' => b't',
+        '\u{2524}' | '\u{252b}' | '\u{2563}' => b'u',
+        '\u{252c}' | '\u{2533}' | '\u{2566}' => b'w',
+        '\u{2534}' | '\u{253b}' | '\u{2569}' => b'v',
+        '\u{253c}' | '\u{254b}' | '\u{256c}' => b'n',
+        '\u{00b0}' => b'f',
+        '\u{00b1}' => b'g',
+        '\u{2264}' => b'y',
+        '\u{2265}' => b'z',
+        '\u{03c0}' => b'{',
+        '\u{2260}' => b'|',
+        '\u{00b7}' | '\u{2022}' => b'~',
+        '\u{25c6}' | '\u{25c8}' => b'`',
+        _ => return None,
+    };
+    Some(0x80 + (acs - 0x5f))
+}
+
 pub struct Tube {
     pub w: i32,
     pub h: i32,
@@ -799,6 +910,17 @@ impl Tube {
         cell_h: i32,
         mut f: impl FnMut(f32, f32, f32, f32),
     ) {
+        if let Some(art) = acs_art(ch) {
+            for &(x0, y0, x1, y1) in art {
+                f(
+                    x + x0 * cell_w as f32,
+                    y + y0 * cell_h as f32,
+                    x + x1 * cell_w as f32,
+                    y + y1 * cell_h as f32,
+                );
+            }
+            return;
+        }
         let Some(glyph) = self.font.glyph(ch) else {
             return;
         };
@@ -1704,6 +1826,32 @@ impl Sink for Tube {
 
 #[cfg(test)]
 mod tests {
+
+    /// Line art has to reach the cell's edges, or a frame comes out as a dashed
+    /// line; and the Unicode characters a UTF-8 program sends have to land on
+    /// the same codes the graphics set uses.
+    #[test]
+    fn line_art_spans_the_cell_and_maps_from_unicode() {
+        let t = Tube::new(64, 64);
+        let mut segs = Vec::new();
+        let rule = 0x80 + (b'q' - 0x5f);
+        t.glyph_strokes(rule, 10.0, 20.0, 14, 24, |a, b, c, d| {
+            segs.push((a, b, c, d))
+        });
+        assert_eq!(segs.len(), 1, "a rule is one stroke");
+        let (x0, y0, x1, y1) = segs[0];
+        assert_eq!((x0, x1), (10.0, 24.0), "edge to edge, so the next cell joins");
+        assert_eq!(y0, y1, "and it is level");
+
+        assert_eq!(crate::tube::box_drawing_code('\u{250c}'), Some(0x80 + (b'l' - 0x5f)));
+        assert_eq!(crate::tube::box_drawing_code('\u{2500}'), Some(rule));
+        assert_eq!(crate::tube::glyph_code('\u{2502}'), 0x80 + (b'x' - 0x5f));
+        // the special graphics codes pass straight through, ASCII stays itself,
+        // and anything else is still '?'
+        assert_eq!(crate::tube::glyph_code('\u{92}'), 0x92);
+        assert_eq!(crate::tube::glyph_code('A'), b'A');
+        assert_eq!(crate::tube::glyph_code('\u{4e2d}'), b'?');
+    }
     use super::*;
     use crate::protocol::Style;
 

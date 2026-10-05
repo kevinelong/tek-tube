@@ -39,6 +39,17 @@ pub enum Attr {
     Bright,
 }
 
+/// The state `ESC 7` saves and `ESC 8` puts back (DECSC/DECRC).
+#[derive(Clone, Copy)]
+struct SavedState {
+    cx: usize,
+    cy: usize,
+    attr: Attr,
+    g0_acs: bool,
+    g1_acs: bool,
+    gl: u8,
+}
+
 pub struct Screen {
     pub cols: usize,
     pub rows: usize,
@@ -50,10 +61,22 @@ pub struct Screen {
     pub cy: usize,
     pub cursor_visible: bool,
     pub autowrap: bool,
+    /// The cursor keys send `ESC O A` rather than `ESC [ A` (DECCKM).  The key
+    /// path reads this, so it is public.
+    pub app_cursor: bool,
+    /// Which of G0 and G1 is the special graphics set, and which is shifted in.
+    /// Programs select it around line art (`ESC ( 0`) and put ASCII back with
+    /// `ESC ( B`, usually without touching SO/SI.
+    g0_acs: bool,
+    g1_acs: bool,
+    gl: u8,
     pub title: String,
     scroll_top: usize,
     scroll_bottom: usize,
-    saved: (usize, usize),
+    /// What `ESC 7` saved and `ESC 8` restores: the cursor, the attribute in
+    /// force and the charset state, which is what DECSC/DECRC are defined to
+    /// carry.
+    saved: SavedState,
     attr_now: Attr,
     /// Set when the cursor is in the pending-wrap state after filling the line.
     pending_wrap: bool,
@@ -87,6 +110,43 @@ struct AltSaved {
 }
 
 impl Screen {
+    /// Apply a charset designator: `0` selects the DEC special graphics set the
+    /// line-drawing characters live in, `B` selects ASCII.  The other sets a
+    /// designator can name (UK, the national variants) differ from ASCII in one
+    /// or two glyphs this face does not draw, so they are treated as ASCII.
+    pub fn set_charset(&mut self, slot: u8, designator: u8) {
+        let acs = designator == b'0';
+        match slot {
+            0 => self.g0_acs = acs,
+            1 => self.g1_acs = acs,
+            _ => {}
+        }
+    }
+
+    /// Is the special graphics set selected right now?
+    fn acs_in_force(&self) -> bool {
+        if self.gl == 0 {
+            self.g0_acs
+        } else {
+            self.g1_acs
+        }
+    }
+
+    /// A printable ASCII byte as it should be *displayed*.
+    ///
+    /// With the special graphics set selected, `0x5F..=0x7E` is line art rather
+    /// than text: `q` is a horizontal rule, `x` a vertical one, `l` `k` `m` `j`
+    /// the corners.  Those are carried on `U+0080..=U+009F` - one code each, the
+    /// same order - so the renderer can tell a drawn rule from a real letter
+    /// without the parser and the font having to share a table.
+    fn charset_char(&self, b: u8) -> char {
+        if self.acs_in_force() && (0x5f..=0x7e).contains(&b) {
+            char::from_u32(0x80 + (b - 0x5f) as u32).unwrap_or(b as char)
+        } else {
+            b as char
+        }
+    }
+
     pub fn new(cols: usize, rows: usize) -> Self {
         Screen {
             cols,
@@ -98,10 +158,21 @@ impl Screen {
             cy: 0,
             cursor_visible: true,
             autowrap: true,
+            app_cursor: false,
+            g0_acs: false,
+            g1_acs: false,
+            gl: 0,
             title: String::new(),
             scroll_top: 0,
             scroll_bottom: rows - 1,
-            saved: (0, 0),
+            saved: SavedState {
+                cx: 0,
+                cy: 0,
+                attr: Attr::Normal,
+                g0_acs: false,
+                g1_acs: false,
+                gl: 0,
+            },
             attr_now: Attr::Normal,
             pending_wrap: false,
             history: std::collections::VecDeque::new(),
@@ -389,7 +460,8 @@ impl Screen {
         self.cy = self.cy.min(rows - 1);
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
-        self.saved = (self.saved.0.min(cols - 1), self.saved.1.min(rows - 1));
+        self.saved.cx = self.saved.cx.min(cols - 1);
+        self.saved.cy = self.saved.cy.min(rows - 1);
         self.pending_wrap = false;
     }
 
@@ -437,6 +509,9 @@ enum State {
     Csi,
     Osc,
     OscEsc,
+    /// Collecting a charset designator - `ESC ( 0` and friends.  The payload is
+    /// the slot it applies to: 0 = G0, 1 = G1, 2 = G2, 3 = G3.
+    Charset(u8),
 }
 
 pub struct Parser {
@@ -508,6 +583,10 @@ impl Parser {
                 State::OscEsc => {
                     self.state = State::Ground;
                 }
+                State::Charset(slot) => {
+                    s.set_charset(slot, b);
+                    self.state = State::Ground;
+                }
             }
         }
         self.take_replies()
@@ -535,12 +614,16 @@ impl Parser {
                 }
             }
             0x07 => self.bell_count += 1,
+            // SO and SI shift between G1 and G0.  Programs usually select the
+            // special graphics set with a designator instead, but both work.
+            0x0e => s.gl = 1,
+            0x0f => s.gl = 0,
             0x00..=0x1f | 0x7f => {}
             _ => {
                 // printable, possibly multi-byte UTF-8
                 if b < 0x80 {
                     self.utf8.clear();
-                    s.put(b as char);
+                    s.put(s.charset_char(b));
                 } else {
                     self.utf8.push(b);
                     if let Some(ch) = decode_utf8(&self.utf8) {
@@ -572,13 +655,34 @@ impl Parser {
                 self.osc_past_prefix = false;
                 State::Osc
             }
+            // Charset designators: `(` `)` `*` `+` name G0..G3, and the byte
+            // that follows names the set (`0` the special graphics set with the
+            // line-drawing characters, `B` ASCII).  Consuming them matters as
+            // much as acting on them: before this, `ESC ( B` - which `ls`, `git`
+            // and `less` all emit when they finish drawing - printed its
+            // designator as the text "(B" in the middle of the output.
+            b'(' => State::Charset(0),
+            b')' => State::Charset(1),
+            b'*' => State::Charset(2),
+            b'+' => State::Charset(3),
             b'7' => {
-                s.saved = (s.cx, s.cy);
+                s.saved = SavedState {
+                    cx: s.cx,
+                    cy: s.cy,
+                    attr: s.attr_now,
+                    g0_acs: s.g0_acs,
+                    g1_acs: s.g1_acs,
+                    gl: s.gl,
+                };
                 State::Ground
             }
             b'8' => {
-                s.cx = s.saved.0;
-                s.cy = s.saved.1;
+                s.cx = s.saved.cx;
+                s.cy = s.saved.cy;
+                s.attr_now = s.saved.attr;
+                s.g0_acs = s.saved.g0_acs;
+                s.g1_acs = s.saved.g1_acs;
+                s.gl = s.saved.gl;
                 State::Ground
             }
             b'D' => {
@@ -774,6 +878,7 @@ impl Parser {
                 let set = fin == b'h';
                 if self.private == Some('?') {
                     match a {
+                        1 => s.app_cursor = set,
                         7 => s.autowrap = set,
                         25 => s.cursor_visible = set,
                         47 => {
@@ -863,6 +968,56 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    /// The special graphics set: selected by a designator, consumed rather than
+    /// printed, and mapped to the codes the renderer draws line art from.
+    #[test]
+    fn the_graphics_set_is_selected_and_consumed() {
+        // `q` in the graphics set is a horizontal rule: code 0x80 + (0x71 - 0x5F)
+        let (s, _, _) = run(b"\x1b(0q", 4, 1);
+        assert_eq!(row_text(&s, 0), "\u{92}");
+        // `ESC ( B` puts ASCII back, and neither designator reaches the screen.
+        // Before this they printed as text, which is how a coloured `ls` grew a
+        // stray "(B" in the middle of its output.
+        let (s, _, _) = run(b"a\x1b(Bb", 4, 1);
+        assert_eq!(row_text(&s, 0), "ab");
+        let (s, _, _) = run(b"\x1b(0\x1b(Bl", 4, 1);
+        assert_eq!(row_text(&s, 0), "l");
+        // every byte in 0x5F..=0x7E is line art while the set is selected -
+        // lower case included, which is why programs toggle it carefully - and
+        // anything outside the range stays text
+        let (s, _, _) = run(b"\x1b(0A", 4, 1);
+        assert_eq!(row_text(&s, 0), "A");
+    }
+
+    /// DECSC/DECRC carry the attribute and the charset, not only the cursor.
+    #[test]
+    fn saving_restores_the_charset_and_the_attribute() {
+        let (s, _, _) = run(b"\x1b[2m\x1b(0\x1b7\x1b[0m\x1b(B\x1b8q", 4, 1);
+        assert_eq!(row_text(&s, 0), "\u{92}", "the graphics set came back");
+        assert!(
+            s.visible_attr(0, 0) == Attr::Dim,
+            "and so did the attribute"
+        );
+    }
+
+    /// DECCKM is a mode; the key path reads it.
+    #[test]
+    fn decckm_is_a_mode() {
+        let (s, _, _) = run(b"\x1b[?1h", 4, 1);
+        assert!(s.app_cursor);
+        let (s, _, _) = run(b"\x1b[?1l", 4, 1);
+        assert!(!s.app_cursor);
+    }
+
+    /// The box-drawing characters a program speaking UTF-8 sends have to arrive
+    /// as themselves: they are what `vim`, `htop` and `tmux` use instead of the
+    /// special graphics set, and before this they came out as `?`.
+    #[test]
+    fn a_utf8_box_character_survives_the_parser() {
+        let (s, _, _) = run("─│┌┐".as_bytes(), 8, 1);
+        assert_eq!(row_text(&s, 0), "─│┌┐");
     }
 
     #[test]

@@ -49,7 +49,7 @@ worst case.  That is the number to design against.
 **The terminal, on the tube (2026-10-02).**  `--shell` renders a live PowerShell
 on the 4010 face with the write beam visible: a pen walks the page in reading
 order and traces only the cells whose character changed, at `WRITE_RATE_DEFAULT`
-= 4000 target dots/s, ten times the 400 it was being run at.  That figure is
+= 2500 target dots/s, six times the 400 it was being run at.  That figure is
 calibrated against the thing it sits beside - a plot file's own beam measures
 4,587 to 15,193 of the 4010's dots per second on the sample vector plots at the
 default 19,200 baud, and 401 dots/s on a point plot - so the pen now draws in the
@@ -63,6 +63,47 @@ the face's own shape and the cell grows with the window - a 2560x1440 screen is 
 93x32 page of 27x45 dot cells - and the stroke weight is derived from the cell
 actually being shown rather than from `--cell`, or the text goes spindly as the
 window grows.
+
+**F2 opens the options panel**, drawn on the tube in the tube's own stroke font:
+the pen rate (`baud`, `write-rate`, `slide`), the phosphor (`beam`, `glow`, the
+two gains, `sat`, `ambient`, `mottle`, `bloom`, `bloom-wide`, `lens`, `camera`,
+`scan`, the dot grid), `trail`, `ghost`, `settle`, `cell` and `exit-after`.  A
+value is applied when the dragging has settled - 0.25 s after the last change -
+rather than every frame, and only `cell`, which changes the page, needs it
+written again.  The phosphor is reconfigured from the parameters the tube was
+built with rather than over the top of the last pass, because `--sat` scales a
+stored chromaticity and would otherwise compound on every drag.
+
+The plot-only options are deliberately **not** in the panel: `--device`,
+`--font`, `--zoom`, `--shrink`, `--text-scale`, `--threads`, `--no-autoclear` and
+`--no-enhanced` belong to decoding a file onto a 4014 face with an Enhanced
+Graphics Module, and a terminal run honours none of them.  A control that moved a
+number nothing reads would be worse than no control at all.
+
+Two of the rows are buttons rather than values: **`wyse`** and **`tek`**.  A preset
+is several variables at once, which is an action rather than a setting, so the row
+carries no value of its own: the press writes the preset's values into the panel's
+own rows, which are then applied through the same mapping the command line uses -
+`--wyse` and the `wyse` button share one list, so they cannot drift.  `tek` is not
+a table of numbers at all: it is "what a machine built with nothing given to it
+reports", computed at the press by the same two calls a launch makes.
+
+**What the terminal answers to.**  Cursor addressing, the erase and editing
+families, scroll regions, the alternate screen, cursor save/restore (DECSC/DECRC,
+which carries the attribute and the charset as well as the cursor) and intensity
+SGR.  Line art arrives one of two ways and both are drawn as strokes on the cell's
+own grid, so a frame's rules meet at the cell edges instead of stopping short:
+the **DEC special graphics set** (`ESC ( 0`, which programs select around a frame
+and put back with `ESC ( B`) and the **UTF-8 box-drawing characters** a modern
+program sends instead - `vim`, `htop` and `tmux` mostly use the second.  Cursor
+keys follow **DECCKM**, so `vim` and `less` get the `ESC O A` form they ask for.
+Colour is swallowed by design (one phosphor), reverse video cannot be drawn on a
+storage tube at all, and there is no mouse reporting.
+
+The type advertised to the child is `vt100` when nothing in the environment says
+otherwise, because that is what is true: over ssh it is what the far end believes
+and acts on, and `xterm-256color` asked for 256 colours and a mouse that do not
+exist here.
 
 **Doubled drawing, found by recording the window.**  A `cls` followed by a long
 listing was recorded frame by frame from the live window (grabber and analysis in

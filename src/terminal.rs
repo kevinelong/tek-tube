@@ -19,6 +19,7 @@
 //!   previous frame is still decaying underneath the new one, which is the
 //!   smear; the commit is the resolve.
 
+use crate::panel;
 use crate::protocol::{LineStyle, Style, Write};
 use crate::tube::Tube;
 use crate::vt;
@@ -128,6 +129,10 @@ pub struct InputBatch {
     pub mods: Mods,
     pub fullscreen: bool,
     pub scroll_lines: i32,
+    /// The options panel's keys.  Empty unless the panel is open, in which case
+    /// the four navigation keys become panel keys and produce no bytes: the shell
+    /// under the panel must not see the arrow that moved the selection.
+    pub panel_keys: Vec<panel::PanelKey>,
 }
 
 /// Translate one batch of window input into the bytes the shell should receive,
@@ -147,7 +152,19 @@ pub struct InputBatch {
 /// The cost is a pasted line break, which arrives as a character with no key
 /// event.  This is a terminal with no bracketed paste, and a doubled Enter on
 /// every press is a far worse trade than that.
-pub fn window_input(events: &[Input], mut mods: Mods, scroll_step: i32) -> InputBatch {
+///
+/// With `panel_open` the options panel has taken the keyboard: the four
+/// navigation keys come back in `panel_keys` rather than going down the wire, so
+/// moving the panel's selection cannot also move the shell's cursor or run its
+/// command line.  Everything else - F11, the scrollback chords, plain typing -
+/// behaves as it always did, panel or no panel.
+pub fn window_input(
+    events: &[Input],
+    mut mods: Mods,
+    scroll_step: i32,
+    app_cursor: bool,
+    panel_open: bool,
+) -> InputBatch {
     let mut out = InputBatch::default();
     for ev in events {
         match ev {
@@ -183,7 +200,12 @@ pub fn window_input(events: &[Input], mut mods: Mods, scroll_step: i32) -> Input
                     } else {
                         -scroll_step
                     };
-                } else if let Some(bytes) = key_sequence(*key, mods.ctrl, mods.alt) {
+                // the panel's keys, before the shell's: `panel_key` only names
+                // the four the panel can use, so anything else falls through to
+                // the normal translation below
+                } else if let Some(k) = panel_open.then_some(panel_key(*key)).flatten() {
+                    out.panel_keys.push(k);
+                } else if let Some(bytes) = key_sequence(*key, mods.ctrl, mods.alt, app_cursor) {
                     out.bytes.extend_from_slice(&bytes);
                 }
             }
@@ -275,7 +297,7 @@ impl Pen {
             }
             let col = i % cols;
             let row = i / cols;
-            let g = if (g as u32) < 127 { g as u8 } else { b'?' };
+            let g = crate::tube::glyph_code(g);
             let y = tube.h - ch - (row as f32 * ch as f32).round() as i32;
             let energy = match screen.visible_attr(col, row) {
                 vt::Attr::Dim => 0.6,
@@ -343,7 +365,7 @@ impl Pen {
             let col = self.cell % cols;
             let row = self.cell / cols;
             let g = screen.visible_char(col, row);
-            let g = if (g as u32) < 127 { g as u8 } else { b'?' };
+            let g = crate::tube::glyph_code(g);
             if self.drawn.get(self.cell).copied().unwrap_or(' ') == g as char {
                 // nothing to do here; walk on for free
                 self.cell += 1;
@@ -474,6 +496,13 @@ pub struct Terminal {
     /// F11 was pressed: the window should change between fullscreen and a
     /// windowed frame.  Set in `poll` so the key never reaches the shell.
     toggle_fullscreen: bool,
+    /// Whether the options panel is open, so the four navigation keys are the
+    /// panel's and never reach the shell.  Set by the window loop, which is what
+    /// owns the panel; `poll` only reads it.
+    pub panel_open: bool,
+    /// The panel keys the last `poll` translated out of the window's input, for
+    /// the window loop to act on.  Taken by `take_panel_keys`.
+    panel_keys: Vec<panel::PanelKey>,
     /// Modifier state, tracked because minifb reports keys, not chords.
     ctrl: bool,
     alt: bool,
@@ -523,13 +552,18 @@ impl Terminal {
         // Say what kind of terminal this is.  TERM is normally inherited - a Git
         // Bash parent has `xterm-256color` - but a shortcut or an Explorer launch
         // has none, and a full screen program that reads TERM as unset or `dumb`
-        // draws a scrolled picture instead of using its screen.  Same for the two
-        // that programs probe to find out whether they are on a terminal at all.
+        // draws a scrolled picture instead of using its screen.
+        //
+        // What is advertised has to be *true*, because over ssh it is what the
+        // far end believes and acts on.  `vt100` is the honest name now that the
+        // parser draws the special graphics set, carries DECSC/DECRC and sends
+        // application cursor keys.  `xterm-256color` asked for 256 colours and a
+        // mouse on a monochrome storage tube, and `COLORTERM=truecolor` asked for
+        // 24 bit colour, which no parser can make true here.
         if std::env::var_os("TERM").is_none() {
-            cmd.env("TERM", "xterm-256color");
+            cmd.env("TERM", "vt100");
         }
         cmd.env("TERM_PROGRAM", "tek-tube");
-        cmd.env("COLORTERM", "truecolor");
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
@@ -578,6 +612,8 @@ impl Terminal {
                 .ok()
                 .and_then(|path| std::fs::File::create(path).ok()),
             toggle_fullscreen: false,
+            panel_open: false,
+            panel_keys: Vec::new(),
             quiet: 0.0,
             since_commit: 0.0,
             committed: false,
@@ -646,6 +682,12 @@ impl Terminal {
     /// F11 was pressed.  Taken rather than read, so one press toggles once.
     pub fn take_fullscreen_toggle(&mut self) -> bool {
         std::mem::take(&mut self.toggle_fullscreen)
+    }
+
+    /// The panel keys the last `poll` translated, in order.  Taken rather than
+    /// read, so one press is handled once; empty unless the panel is open.
+    pub fn take_panel_keys(&mut self) -> Vec<panel::PanelKey> {
+        std::mem::take(&mut self.panel_keys)
     }
 
     /// Is the pen still tracing?
@@ -764,10 +806,15 @@ impl Terminal {
                 shift: self.shift,
             },
             self.rows as i32 - 1,
+            self.screen.app_cursor,
+            self.panel_open,
         );
         self.ctrl = batch.mods.ctrl;
         self.alt = batch.mods.alt;
         self.shift = batch.mods.shift;
+        // The panel's keys are the window loop's to act on - it owns the panel -
+        // so they are kept for `take_panel_keys` rather than handled here.
+        self.panel_keys = batch.panel_keys;
         if batch.fullscreen {
             self.toggle_fullscreen = true;
         }
@@ -1079,7 +1126,7 @@ pub fn stroke_screen(
             }
             // the stroke font is ASCII; anything else draws as '?' rather than
             // silently vanishing
-            let glyph = if (g as u32) < 127 { g as u8 } else { b'?' };
+            let glyph = crate::tube::glyph_code(g);
             // SGR brightness: a storage tube cannot go above full charge, so
             // "bright" is the ordinary level and only "dim" is expressible
             let energy = match screen.visible_attr(c, r) {
@@ -1162,7 +1209,7 @@ pub fn stroke_changed(
             if last.get(r * cols + c).copied().unwrap_or(' ') == g {
                 continue;
             }
-            let glyph = if (g as u32) < 127 { g as u8 } else { b'?' };
+            let glyph = crate::tube::glyph_code(g);
             let energy = match screen.visible_attr(c, r) {
                 vt::Attr::Dim => 0.6,
                 _ => 1.0,
@@ -1207,6 +1254,21 @@ pub fn draw_cursor(
     );
 }
 
+/// The panel key a window key names, if it is one the options panel uses.
+///
+/// Four keys and no more: the panel is a list of rows, so it needs a move and a
+/// commit, plus Escape to close it.  Anything else - a letter, a chord - is not
+/// the panel's and is left to the shell.
+fn panel_key(key: Key) -> Option<panel::PanelKey> {
+    Some(match key {
+        Key::Up => panel::PanelKey::Up,
+        Key::Down => panel::PanelKey::Down,
+        Key::Enter => panel::PanelKey::Enter,
+        Key::Escape => panel::PanelKey::Escape,
+        _ => return None,
+    })
+}
+
 /// The bytes a key sends to the shell, or `None` if the key is not one we send.
 ///
 /// Printable text does *not* come through here: minifb reports it through
@@ -1215,11 +1277,11 @@ pub fn draw_cursor(
 /// **not** ours to send, and sending one - which an earlier version did, mapping
 /// every letter to a C0 control unconditionally - puts a stray control character
 /// on the wire for every key typed.  Letters belong here only with Ctrl held.
-pub fn key_sequence(key: Key, ctrl: bool, alt: bool) -> Option<Vec<u8>> {
+pub fn key_sequence(key: Key, ctrl: bool, alt: bool, app_cursor: bool) -> Option<Vec<u8>> {
     let body: &[u8] = if ctrl {
         ctrl_code(key)?
     } else {
-        named_key(key)?
+        named_key(key, app_cursor)?
     };
     if alt {
         let mut out = Vec::with_capacity(body.len() + 1);
@@ -1268,18 +1330,21 @@ fn ctrl_code(key: Key) -> Option<&'static [u8]> {
 }
 
 /// Keys that have no character of their own.
-fn named_key(key: Key) -> Option<&'static [u8]> {
+fn named_key(key: Key, app_cursor: bool) -> Option<&'static [u8]> {
     Some(match key {
         Key::Enter => b"\r",
         Key::Backspace => b"\x7f",
         Key::Tab => b"\t",
         Key::Escape => b"\x1b",
-        Key::Up => b"\x1b[A",
-        Key::Down => b"\x1b[B",
-        Key::Right => b"\x1b[C",
-        Key::Left => b"\x1b[D",
-        Key::Home => b"\x1b[H",
-        Key::End => b"\x1b[F",
+        // DECCKM: in application cursor mode the arrows and Home/End are sent
+        // with SS3 (`ESC O`) rather than CSI, which is what vim and less ask for
+        // and what they match on.
+        Key::Up => if app_cursor { b"\x1bOA" } else { b"\x1b[A" },
+        Key::Down => if app_cursor { b"\x1bOB" } else { b"\x1b[B" },
+        Key::Right => if app_cursor { b"\x1bOC" } else { b"\x1b[C" },
+        Key::Left => if app_cursor { b"\x1bOD" } else { b"\x1b[D" },
+        Key::Home => if app_cursor { b"\x1bOH" } else { b"\x1b[H" },
+        Key::End => if app_cursor { b"\x1bOF" } else { b"\x1b[F" },
         Key::PageUp => b"\x1b[5~",
         Key::PageDown => b"\x1b[6~",
         Key::Insert => b"\x1b[2~",
@@ -1306,40 +1371,40 @@ mod tests {
 
     #[test]
     fn keys_map_to_the_expected_sequences() {
-        assert_eq!(key_sequence(Key::Enter, false, false), Some(b"\r".to_vec()));
+        assert_eq!(key_sequence(Key::Enter, false, false, false), Some(b"\r".to_vec()));
         assert_eq!(
-            key_sequence(Key::Backspace, false, false),
+            key_sequence(Key::Backspace, false, false, false),
             Some(b"\x7f".to_vec())
         );
         assert_eq!(
-            key_sequence(Key::Up, false, false),
+            key_sequence(Key::Up, false, false, false),
             Some(b"\x1b[A".to_vec())
         );
         assert_eq!(
-            key_sequence(Key::Delete, false, false),
+            key_sequence(Key::Delete, false, false, false),
             Some(b"\x1b[3~".to_vec())
         );
         assert_eq!(
-            key_sequence(Key::F5, false, false),
+            key_sequence(Key::F5, false, false, false),
             Some(b"\x1b[15~".to_vec())
         );
         // Ctrl+C is C0 0x03 - PSReadLine needs this for copy and for interrupt
-        assert_eq!(key_sequence(Key::C, true, false), Some(b"\x03".to_vec()));
+        assert_eq!(key_sequence(Key::C, true, false, false), Some(b"\x03".to_vec()));
         // Alt is an ESC prefix
         assert_eq!(
-            key_sequence(Key::Enter, false, true),
+            key_sequence(Key::Enter, false, true, false),
             Some(b"\x1b\r".to_vec())
         );
 
         // A *plain* letter is not ours to send: it arrives through add_char, and
         // sending a C0 control here as well would put a stray byte on the wire
         // for every key typed.  That was a real bug.
-        assert_eq!(key_sequence(Key::A, false, false), None);
-        assert_eq!(key_sequence(Key::Z, false, false), None);
-        assert_eq!(key_sequence(Key::A, true, false), Some(b"\x01".to_vec()));
+        assert_eq!(key_sequence(Key::A, false, false, false), None);
+        assert_eq!(key_sequence(Key::Z, false, false, false), None);
+        assert_eq!(key_sequence(Key::A, true, false, false), Some(b"\x01".to_vec()));
         // and keys we have no mapping for
-        assert_eq!(key_sequence(Key::LeftShift, false, false), None);
-        assert_eq!(key_sequence(Key::NumPad5, false, false), None);
+        assert_eq!(key_sequence(Key::LeftShift, false, false, false), None);
+        assert_eq!(key_sequence(Key::NumPad5, false, false, false), None);
     }
 
     /// One press of Enter reaches the window twice - Windows sends `WM_KEYDOWN`
@@ -1355,8 +1420,63 @@ mod tests {
             Input::Key(Key::Enter, false),
             Input::Text('\r'),
         ];
-        let batch = window_input(&events, Mods::default(), 17);
+        let batch = window_input(&events, Mods::default(), 17, false, false);
         assert_eq!(batch.bytes, b"\r");
+    }
+
+    /// In application cursor mode the arrows go out as SS3 - `ESC O A` - which
+    /// is what vim and less ask for with DECCKM and what they match on.  Sent as
+    /// CSI anyway, they are read as a plain escape and a letter.
+    #[test]
+    fn arrows_follow_the_cursor_key_mode() {
+        let up = [Input::Key(Key::Up, true)];
+        assert_eq!(
+            window_input(&up, Mods::default(), 17, false, false).bytes,
+            b"\x1b[A"
+        );
+        assert_eq!(window_input(&up, Mods::default(), 17, true, false).bytes, b"\x1bOA");
+        let home = [Input::Key(Key::Home, true)];
+        assert_eq!(
+            window_input(&home, Mods::default(), 17, true, false).bytes,
+            b"\x1bOH"
+        );
+    }
+
+    /// With the options panel open the four navigation keys belong to it: they
+    /// come back as panel keys and produce no bytes, so Enter on a row cannot
+    /// also run the shell's command line underneath and an arrow cannot move the
+    /// shell's cursor.  With the panel closed the same four keys are the shell's
+    /// again, exactly as before the panel existed.
+    #[test]
+    fn the_panel_takes_the_navigation_keys_from_the_shell() {
+        let events = [
+            Input::Key(Key::Up, true),
+            Input::Key(Key::Down, true),
+            Input::Key(Key::Enter, true),
+            Input::Key(Key::Escape, true),
+        ];
+        let batch = window_input(&events, Mods::default(), 17, false, true);
+        assert!(
+            matches!(
+                batch.panel_keys.as_slice(),
+                [
+                    crate::panel::PanelKey::Up,
+                    crate::panel::PanelKey::Down,
+                    crate::panel::PanelKey::Enter,
+                    crate::panel::PanelKey::Escape,
+                ]
+            ),
+            "the four navigation keys become panel keys"
+        );
+        assert!(
+            batch.bytes.is_empty(),
+            "and none of them reaches the shell: {:?}",
+            batch.bytes
+        );
+
+        let batch = window_input(&events, Mods::default(), 17, false, false);
+        assert!(batch.panel_keys.is_empty(), "a closed panel takes nothing");
+        assert_eq!(batch.bytes, b"\x1b[A\x1b[B\r\x1b");
     }
 
     /// The same for Backspace, which the two paths spell differently (0x7f from
@@ -1370,7 +1490,7 @@ mod tests {
             Input::Key(Key::Backspace, false),
             Input::Text('\x08'),
         ];
-        assert_eq!(window_input(&bs, Mods::default(), 17).bytes, b"\x7f");
+        assert_eq!(window_input(&bs, Mods::default(), 17, false, false).bytes, b"\x7f");
 
         let ctrl_c = [
             Input::Key(Key::LeftCtrl, true),
@@ -1379,7 +1499,7 @@ mod tests {
             Input::Key(Key::C, false),
             Input::Key(Key::LeftCtrl, false),
         ];
-        let batch = window_input(&ctrl_c, Mods::default(), 17);
+        let batch = window_input(&ctrl_c, Mods::default(), 17, false, false);
         assert_eq!(batch.bytes, b"\x03");
         assert!(!batch.mods.ctrl, "the modifier state comes back with it");
     }
@@ -1397,7 +1517,7 @@ mod tests {
             Input::Text('b'),
             Input::Text('\t'),
         ];
-        assert_eq!(window_input(&events, Mods::default(), 17).bytes, b"ab");
+        assert_eq!(window_input(&events, Mods::default(), 17, false, false).bytes, b"ab");
     }
 
     /// The heart of terminal mode: content written while it is still moving

@@ -265,6 +265,16 @@ instead.  A window cannot change its own decorations, so F11 rebuilds the window
 rather than restyling it, and the shell and the tube simply carry on: nothing is
 lost but the image, which the pen redraws (see below).  ESC quits.
 
+**F2 opens the options panel**: the variables a terminal run honours, adjustable
+while it runs - the pen rate, the phosphor, the trail, the cell size.  A slider
+follows the mouse at once, but the tube is recomposed only once the dragging has
+*settled*, a quarter of a second after the last change: a fullscreen frame is
+~35 ms and recomposing on every mouse move would spend a core showing the same
+picture with one number different.  Only the cell size needs the page written
+again.  A click on a slider jumps the value there and starts a drag; the wheel
+nudges the row under the pointer.  The panel is drawn over the frame that is
+already there, so it stays with the mouse while the costly half waits.
+
 For a plot file the window is the whole primary monitor and the face is rendered
 at the largest integer down-sample that fits the screen, then *centred without
 any scaling* (`ScaleMode::Center`), so nothing is resampled and the rest of the
@@ -305,12 +315,15 @@ hardware was bought for.
 Driving a modern *interactive* shell is what does not work, for reasons that are
 the hardware's rather than the emulator's:
 
-* **The VT parser is measured, not complete.**  It implements what a real
-  PowerShell session was observed to use - CUP (`ESC[H`, `ESC[5;10H`), erase of
-  the display, erase to end of line, erase *n* characters, cursor reports
-  (`CSI 6n`), scroll regions, the alternate screen and intensity SGR - because
-  that is what a console host and PSReadLine actually emit.  A full-screen
-  application leaning on the parts that were never seen is untested ground.
+* **The VT parser covers what a terminal needs, measured rather than assumed.**
+  Cursor addressing (absolute and relative), the erase family, insert and delete
+  of lines and characters, scroll regions, the alternate screen, cursor
+  save/restore, intensity SGR, cursor reports, and now the two ways line art
+  arrives: the DEC special graphics set (`ESC ( 0`) and the UTF-8 box-drawing
+  characters, both drawn as strokes on the tube's own grid so frames join across
+  cells.  Cursor keys follow DECCKM.  What it does not cover is anything that
+  needs colour (one phosphor), reverse video (you cannot un-write stored charge)
+  or mouse reporting - and an application leaning on those is untested ground.
   Colour escapes are swallowed, which is the right answer for a monochrome green
   tube, and SGR intensity maps to stored charge: a storage tube cannot go above
   full charge, so only "dim" is expressible.
@@ -611,7 +624,9 @@ window's frame rate.
 * **Ctrl+Shift+Q** quits, or just exit the shell.  ESC has to reach the shell,
   so it can no longer be the quit key, and **F11** - which the shell has no use
   for - toggles fullscreen.  Both are consumed by the window and never reach the
-  shell.
+  shell.  **F2** opens the options panel; the mouse drives it and the shell never
+  sees that either.  While it is open the wheel belongs to the panel, so the
+  scrollback is not scrolled underneath it.
 * Keys without a character are translated to VT sequences (arrows, F1-F12,
   Home/End/PgUp/PgDn, Insert/Delete, Ctrl+letter); printable text goes through
   minifb's Unicode input, so keyboard layout and AltGr are handled for you.

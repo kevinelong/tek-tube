@@ -7,6 +7,7 @@
 //! acid green stored image, exactly like the real terminal.
 
 mod font;
+mod panel;
 mod protocol;
 mod terminal;
 mod tube;
@@ -17,6 +18,7 @@ use protocol::{Decoder, Device, Write};
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::Instant;
 use tube::Tube;
 
@@ -359,22 +361,51 @@ fn main() -> Result<(), Box<dyn Error>> {
     run(opts)
 }
 
+/// The shell to run when the command line names nothing: the platform's own.
+///
+/// An absolute path, because a bare `powershell.exe` does not resolve when the
+/// program is launched from Explorer or a shortcut - which is exactly when there
+/// are no arguments to go on.  Nothing found means no default, and the usage is
+/// printed the way it always was.
+fn default_shell() -> Option<String> {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    for candidate in [
+        format!("{root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
+        format!("{root}\\System32\\cmd.exe"),
+    ] {
+        if std::path::Path::new(&candidate).exists() {
+            return Some(candidate);
+        }
+    }
+    std::env::var("SHELL").ok().filter(|s| !s.is_empty())
+}
+
 /// Everything after the command line: choose a mode and go.
 ///
 /// A function rather than the body of `main` so the terminal can also be started
 /// from the test harness, which on this machine is the only kind of binary the
 /// application control policy will run - see the `terminal` test at the end.
-fn run(opts: Options) -> Result<(), Box<dyn Error>> {
+///
+/// The options are owned and mutable, because the terminal's options panel edits
+/// them while it runs.
+fn run(mut opts: Options) -> Result<(), Box<dyn Error>> {
     if let Some(n) = opts.threads {
         tube::set_render_threads(n);
     }
     if let Some(command) = opts.shell.clone() {
-        return run_shell(&command, &opts);
+        return run_shell(&command, &mut opts);
     }
     if let Some(path) = opts.vt_replay.clone() {
         return replay_terminal(&path, &opts);
     }
     if opts.files.is_empty() {
+        // Nothing named: a terminal on the platform's shell.  This is the mode
+        // the machine is for, and the one the harness has always defaulted to;
+        // printing the usage and exiting was the only way to launch it that did
+        // nothing at all.
+        if let Some(command) = default_shell() {
+            return run_shell(&command, &mut opts);
+        }
         print!("{}", USAGE);
         return Ok(());
     }
@@ -512,7 +543,7 @@ fn run(opts: Options) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    run_window(&mut player, tw, th, &opts, fullscreen, screen)?;
+    run_window(&mut player, tw, th, &mut opts, fullscreen, screen)?;
     Ok(())
 }
 
@@ -606,21 +637,31 @@ impl Player {
         decoder.enhanced = opts.enhanced && dev == Device::Tek4014;
         decoder.record_chars = opts.dump_chars;
         decoder.text_scale = opts.text_scale;
+        let mut player = Player {
+            data,
+            cursor: 0,
+            decoder,
+            tube,
+            rate: 0.0,
+            credit: 0.0,
+            instant: true,
+            done: false,
+        };
+        player.set_rate(opts);
+        player
+    }
+
+    /// Re-derive the link rate from the options, so the panel's baud and speed
+    /// move a running plot the way the command line moves a fresh one.  The
+    /// credit already banked is left alone: the change takes effect from here.
+    fn set_rate(&mut self, opts: &Options) {
         let (rate, instant) = if opts.baud <= 0.0 || opts.speed <= 0.0 {
             (0.0, true)
         } else {
             (opts.baud / 10.0 * opts.speed, false)
         };
-        Player {
-            data,
-            cursor: 0,
-            decoder,
-            tube,
-            rate,
-            credit: 0.0,
-            instant,
-            done: false,
-        }
+        self.rate = rate;
+        self.instant = instant;
     }
 
     /// Consume input for `dt` seconds of terminal time and age the phosphor.
@@ -765,8 +806,338 @@ fn configure_terminal_tube(tube: &mut Tube, dev: Device, opts: &Options, cell: f
     tube.ghost_tau = opts.ghost.unwrap_or(0.0);
 }
 
+fn slider(name: &'static str, min: f32, max: f32, value: f32, structural: bool) -> panel::Row {
+    panel::Row {
+        name,
+        kind: panel::Kind::Slider { min, max },
+        value,
+        structural,
+    }
+}
+
+fn toggle(name: &'static str, value: f32, structural: bool) -> panel::Row {
+    panel::Row {
+        name,
+        kind: panel::Kind::Toggle,
+        value,
+        structural,
+    }
+}
+
+/// A chooser: a row whose value is an index into a fixed list of names.
+///
+/// The preset row is the only one the panel offers.  A preset is not a value of
+/// its own - it is the *state* the other rows are in - so the index here is
+/// derived from them (see `preset_index`) rather than remembered, and only the
+/// press applies anything.
+fn choice(name: &'static str, list: &'static [&'static str], index: usize) -> panel::Row {
+    panel::Row {
+        name,
+        kind: panel::Kind::Choice(list),
+        value: index as f32,
+        structural: false,
+    }
+}
+
+/// The presets the chooser offers, in the order it lists them.  One past the end
+/// is `custom`: the rows match none of them.
+const PRESETS: &[&str] = &["wyse", "tek"];
+
+/// Which preset the rows currently match, or `list.len()` for "custom".
+///
+/// A preset is derived, never stored.  Only the rows a preset *names* are
+/// compared, so a variable a preset says nothing about can never make the machine
+/// read as custom, and a small tolerance absorbs the rounding of a dragged
+/// slider.  The first match wins, which is the whole tie-break.
+fn preset_index(rows: &[panel::Row]) -> usize {
+    PRESETS
+        .iter()
+        .position(|name| {
+            preset_rows(name).is_some_and(|bundle| {
+                bundle.iter().all(|(row_name, want)| {
+                    rows.iter()
+                        .find(|r| r.name == *row_name)
+                        .is_some_and(|r| (r.value - want).abs() < 1e-3)
+                })
+            })
+        })
+        .unwrap_or(PRESETS.len())
+}
+
+/// Write the derived preset index into the `preset` row, so it reads the preset
+/// the machine is set to, or `custom` once one variable is nudged away.
+fn sync_preset_row(rows: &mut [panel::Row]) {
+    let index = preset_index(rows);
+    if let Some(row) = rows.iter_mut().find(|r| r.name == "preset") {
+        row.value = index as f32;
+    }
+}
+
+/// The Wyse-like preset - what `--wyse` sets, as one list, so the flag and the
+/// panel's preset row cannot drift apart.
+///
+/// No beam writer (the glyphs just appear), a screenful per step, the page before
+/// it fading, the scan's own stripes, a ROM-ish dot grid, a black face rather than
+/// a lit flood field, a short glow, and a paced serial link.
+const WYSE: &[(&str, f32)] = &[
+    ("write-rate", 0.0),
+    ("slide", 0.0),
+    ("ghost", 0.1),
+    ("scan", 0.5),
+    ("dots", 15.0),
+    ("ambient", 0.0),
+    ("trail", 0.2),
+    ("baud", 19200.0),
+];
+
+/// The `tek` preset: what a machine built with nothing given to it reports,
+/// computed here by the same two calls a launch makes, so the preset cannot drift
+/// from the defaults it means.  Built once, because the chooser reads it on every
+/// settle, and the tube a launch builds is not cheap to make.
+static TEK: LazyLock<Vec<(&'static str, f32)>> = LazyLock::new(|| {
+    let fresh = Options::default();
+    let cell = fresh.cell.unwrap_or(terminal::CELL_SCALE_DEFAULT);
+    let mut tube = Tube::new(1024, 780);
+    configure_terminal_tube(&mut tube, Device::Tek4010, &fresh, cell);
+    raw_rows(&fresh, &tube)
+        .into_iter()
+        // the chooser is a view of the other rows, not one of them: a preset
+        // naming itself would be circular
+        .filter(|r| r.name != "preset")
+        .map(|r| (r.name, r.value))
+        .collect()
+});
+
+/// The rows a preset sets, in the panel's own names, or None if the name is not a
+/// preset.
+///
+/// `wyse` is a list of numbers, written out.  `tek` is not: it is read off a fresh
+/// machine, so it cannot drift from the defaults it means.
+fn preset_rows(name: &str) -> Option<&'static [(&'static str, f32)]> {
+    match name {
+        "wyse" => Some(WYSE),
+        "tek" => Some(&TEK),
+        _ => None,
+    }
+}
+
+/// Apply a preset to the panel's rows: everything a preset press means.  Returns
+/// true if the page has to be written again, which only the cell size forces.
+fn apply_preset_rows(rows: &mut [panel::Row], name: &str) -> bool {
+    let Some(bundle) = preset_rows(name) else {
+        return false;
+    };
+    let cell_before = rows.iter().find(|r| r.name == "cell").map(|r| r.value);
+    for &(row_name, value) in bundle {
+        if let Some(row) = rows.iter_mut().find(|r| r.name == row_name) {
+            row.value = value;
+        }
+    }
+    let cell_after = rows.iter().find(|r| r.name == "cell").map(|r| r.value);
+    cell_before != cell_after
+}
+
+/// The options panel's rows: the variables a terminal run honours.
+///
+/// Read from the options, and for the ones the tube is *holding* (the phosphor
+/// gains, the scan, the ghost, the dot grid) from the tube, so the panel shows
+/// what the machine is set to rather than a parallel table of defaults.
+fn panel_rows(opts: &Options, tube: &Tube) -> Vec<panel::Row> {
+    let mut rows = raw_rows(opts, tube);
+    // the chooser is a view of the rest, so it can only be filled in once they
+    // have all been built
+    sync_preset_row(&mut rows);
+    rows
+}
+
+/// The same rows, without the chooser's derived value filled in.
+///
+/// Split out because reading a preset off a fresh machine - which is how `tek` is
+/// defined - must not come back through `panel_rows` and ask `preset_index`, which
+/// asks *it*: that recursion overflowed the stack the moment the chooser was filled
+/// in at construction.
+fn raw_rows(opts: &Options, tube: &Tube) -> Vec<panel::Row> {
+    let ph = &tube.phosphor;
+    // Only the variables a *terminal* run honours.  --device, --zoom, --shrink,
+    // --text-scale, --threads, --no-autoclear, --no-enhanced and --font belong to
+    // the plot path (there is no 12 bit coordinate stream and no file being
+    // decoded here), so a control for them would move a number that nothing
+    // reads.
+    vec![
+        // A preset is a *state*, not a value, so the rows start with one chooser
+        // that shows which preset the values below it match.  It is filled in
+        // once they exist, so the placeholder index here is never read.
+        choice("preset", PRESETS, 0),
+        slider("baud", 0.0, 115200.0, opts.baud, false),
+        slider("beam", 0.1, 2.0, opts.beam, false),
+        slider("glow", 0.0, 2.0, opts.glow, false),
+        slider("settle", 0.0, 8.0, opts.settle, false),
+        slider("store-gain", 0.0, 2.0, ph.stored_gain, false),
+        slider("fresh-gain", 0.0, 2.0, ph.fresh_gain, false),
+        slider("sat", 0.0, 4.0, opts.sat.unwrap_or(1.0), false),
+        slider("ambient", 0.0, 0.4, ph.ambient, false),
+        slider("mottle", 0.0, 0.4, ph.mottle, false),
+        slider("bloom", 0.0, 0.5, ph.bloom, false),
+        slider("bloom-wide", 0.0, 0.3, ph.bloom_wide, false),
+        slider("lens", 0.0, 1.2, ph.cam_blur, false),
+        toggle("camera", opts.camera as u8 as f32, false),
+        slider("scan", 0.0, 0.95, ph.scan_depth, false),
+        slider("dots", 0.0, 32.0, tube.dot_rows as f32, false),
+        slider("trail", 0.0, 2.0, opts.trail.unwrap_or(1.1), false),
+        slider(
+            "write-rate",
+            0.0,
+            8000.0,
+            opts.write_rate.unwrap_or(terminal::WRITE_RATE_DEFAULT),
+            false,
+        ),
+        slider("ghost", 0.0, 2.0, tube.ghost_tau, false),
+        slider(
+            "slide",
+            0.0,
+            120.0,
+            opts.slide.unwrap_or(terminal::SLIDE_RATE),
+            false,
+        ),
+        slider(
+            "cell",
+            0.5,
+            3.0,
+            opts.cell.unwrap_or(terminal::CELL_SCALE_DEFAULT),
+            true,
+        ),
+        slider(
+            "exit-after",
+            0.0,
+            600.0,
+            opts.exit_after.unwrap_or(0.0),
+            false,
+        ),
+    ]
+}
+
+/// Set one named option.  Returns false if this panel has no handler for the name.
+///
+/// The single mapping from a row name to an option: the panel applies its rows
+/// through it, `--wyse` sets its options through it, and a preset goes through it
+/// after its values have been written into the panel's rows.  One mapping means a
+/// preset cannot mean one thing from the command line and another from the panel.
+fn apply_value(opts: &mut Options, name: &str, v: f32) -> bool {
+    match name {
+        "baud" => {
+            opts.baud = v;
+            opts.baud_given = true;
+        }
+        "beam" => opts.beam = v,
+        "glow" => opts.glow = v,
+        "speed" => opts.speed = v,
+        "settle" => opts.settle = v,
+        "store-gain" => opts.store_gain = Some(v),
+        "fresh-gain" => opts.fresh_gain = Some(v),
+        "sat" => opts.sat = Some(v),
+        "ambient" => opts.ambient = Some(v),
+        "mottle" => opts.mottle = Some(v),
+        "bloom" => opts.bloom = Some(v),
+        "bloom-wide" => opts.bloom_wide = Some(v),
+        "lens" => opts.lens = Some(v),
+        "camera" => opts.camera = v > 0.5,
+        "scan" => opts.scan = Some(v),
+        "dots" => opts.dots = Some(v.round().max(0.0) as usize),
+        "trail" => opts.trail = Some(v),
+        // 0 is an instant page, as on the command line: the pace is cleared
+        // rather than left alone
+        "write-rate" => opts.write_rate = Some(v),
+        "ghost" => opts.ghost = Some(v),
+        "slide" => opts.slide = Some(v),
+        "cell" => opts.cell = Some(v),
+        "exit-after" => opts.exit_after = if v <= 0.0 { None } else { Some(v) },
+        // The chooser holds an index, not an option: pressing it applies a whole
+        // preset, and the caller does that through the rows the preset names.
+        // Handled so the mapping reports the name - the row is applied like any
+        // other - but it moves nothing itself.
+        "preset" => {}
+        _ => return false,
+    }
+    true
+}
+
+/// Copy the panel's values back into the options.  Returns true if anything changed
+/// that needs the tube reconfigured and the page written again, rather than just
+/// recomposed.
+fn apply_rows(opts: &mut Options, rows: &[panel::Row]) -> bool {
+    let mut structural = false;
+    for row in rows {
+        // The call has to be *outside* the assertion.  Written as
+        // `debug_assert!(apply_value(...))` - which is how this started - the
+        // whole expression is compiled away in release, so nothing was applied:
+        // the panel moved its rows and the machine never changed, which cost an
+        // afternoon of chasing a live "the settle does nothing" that only the
+        // release build had.
+        let applied = apply_value(opts, row.name, row.value);
+        // A control the panel offers but nothing applies is a slider that moves a
+        // number nothing reads, which is worse than no slider at all.
+        debug_assert!(applied, "panel row `{}` has no handler", row.name);
+        structural |= row.structural;
+    }
+    structural
+}
+
+/// The options panel's rows for a running plot file.
+///
+/// A plot is not a terminal, so this is not the terminal's row set: it is the
+/// variables the *plot* path reads, or can be made to read, while it plays.  The
+/// tube's own appearance is live because the render works from the tube rather
+/// than from the options, and the settle reconfigures the tube from the rows: the
+/// beam, the glow, the phosphor gains, the scan, the dot grid, the camera and its
+/// lens all take effect on the next frame.  The link (`baud`, `speed`) is a
+/// property of the player, which the settle re-derives, and `exit-after` is read
+/// every frame.
+///
+/// What is deliberately *not* here:
+///
+/// * `device` - a different target is a different tube and a different decoder,
+///   which is a relaunch, not a row.
+/// * `zoom` and `shrink` - they size the window, which cannot change without
+///   rebuilding it; the row would move a number and nothing else.
+/// * `font` and `text-scale`, `autoclear`, `enhanced` - they change how *future*
+///   bytes are drawn or decoded, so on a page already drawn they do nothing.
+/// * `png`, `png-at`, `png-seq`, `settle`, `frames`, `frame-dt`, `probe`,
+///   `stats`, `dump-chars` - there is no windowless render here at all.
+/// * the terminal's own rows (`trail`, `ghost`, `slide`, `write-rate`, `cell`) -
+///   the plot path never reads them, so a control for them would move a number
+///   nothing reads.
+/// * the preset chooser - the presets are bundles of *terminal* rows, and the
+///   plot path honours none of them as a bundle.
+fn plot_rows(opts: &Options, tube: &Tube) -> Vec<panel::Row> {
+    let ph = &tube.phosphor;
+    vec![
+        slider("baud", 0.0, 115200.0, opts.baud, false),
+        slider("speed", 0.0, 8.0, opts.speed, false),
+        slider("beam", 0.1, 2.0, opts.beam, false),
+        slider("glow", 0.0, 2.0, opts.glow, false),
+        slider("store-gain", 0.0, 2.0, ph.stored_gain, false),
+        slider("fresh-gain", 0.0, 2.0, ph.fresh_gain, false),
+        slider("sat", 0.0, 4.0, opts.sat.unwrap_or(1.0), false),
+        slider("ambient", 0.0, 0.4, ph.ambient, false),
+        slider("mottle", 0.0, 0.4, ph.mottle, false),
+        slider("bloom", 0.0, 0.5, ph.bloom, false),
+        slider("bloom-wide", 0.0, 0.3, ph.bloom_wide, false),
+        slider("scan", 0.0, 0.95, ph.scan_depth, false),
+        slider("dots", 0.0, 32.0, tube.dot_rows as f32, false),
+        slider("lens", 0.0, 1.2, ph.cam_blur, false),
+        toggle("camera", opts.camera as u8 as f32, false),
+        slider(
+            "exit-after",
+            0.0,
+            600.0,
+            opts.exit_after.unwrap_or(0.0),
+            false,
+        ),
+    ]
+}
+
 /// Terminal mode: run a shell under a pseudoconsole and render it on the tube.
-fn run_shell(command: &str, opts: &Options) -> Result<(), Box<dyn Error>> {
+fn run_shell(command: &str, opts: &mut Options) -> Result<(), Box<dyn Error>> {
     // The terminal always uses the 4010's face.  It is not addressed as a 4014
     // (there is no 12 bit coordinate stream to honour), and the tube *is* the
     // window here, so --device, --shrink and --zoom do not apply: the face is
@@ -826,15 +1197,7 @@ fn run_shell(command: &str, opts: &Options) -> Result<(), Box<dyn Error>> {
         );
     }
     run_terminal_window(
-        &mut term,
-        &mut tube,
-        dev,
-        opts,
-        fullscreen,
-        screen,
-        opts.exit_after,
-        opts.quiet,
-        cell,
+        &mut term, &mut tube, dev, opts, fullscreen, screen, opts.quiet, cell,
     )
 }
 
@@ -843,14 +1206,13 @@ fn run_terminal_window(
     term: &mut terminal::Terminal,
     tube: &mut Tube,
     dev: Device,
-    opts: &Options,
+    opts: &mut Options,
     fullscreen: bool,
     screen: Option<(usize, usize)>,
-    exit_after: Option<f32>,
     quiet: bool,
     cell_scale: f32,
 ) -> Result<(), Box<dyn Error>> {
-    use minifb::{Key, ScaleMode, Window, WindowOptions};
+    use minifb::{Key, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
     let started = Instant::now();
     // F11 out of a fullscreen start should land on the tube's own face rather
     // than on a window the size of the screen.
@@ -901,6 +1263,22 @@ fn run_terminal_window(
         window.set_target_fps(60);
 
         let mut buf: Vec<u32> = Vec::new();
+        // The composed frame is kept apart from the presented buffer: while the
+        // options panel is open it is drawn over a *copy* of the frame every
+        // frame, so the panel follows the mouse without recomposing the tube.
+        let mut frame: Vec<u32> = Vec::new();
+        let mut panel = panel::Panel::new(panel_rows(opts, tube));
+        // the parameters the tube was built with, so a reconfigure from the panel
+        // is a fresh configuration rather than a second coat of it
+        let base_phosphor = tube.phosphor.clone();
+        let mut f2_was = false;
+        // The four keys that drive the panel while it is open, one `_was` edge
+        // each so a held key acts once - the same edge F2 uses.  `panel_takes_keys`
+        // is what the pump is told: the keyboard belongs to the panel, which is
+        // also true for as long as the ESC that closed it is held down (see
+        // below).
+        let mut nav_was = [false; 4];
+        let mut panel_takes_keys = false;
         let mut last = Instant::now();
         let mut dirty = true;
         let mut toggle = false;
@@ -927,7 +1305,7 @@ fn run_terminal_window(
             } else {
                 dead_frames = 0;
             }
-            if let Some(limit) = exit_after {
+            if let Some(limit) = opts.exit_after {
                 if started.elapsed().as_secs_f32() > limit {
                     break;
                 }
@@ -963,11 +1341,126 @@ fn run_terminal_window(
                 }
             }
 
+            // The options panel: F2 toggles it, the mouse drives it, and the tube
+            // is only reconfigured and recomposed once a drag has *settled* - a
+            // fullscreen frame is ~35 ms, and recomposing on every mouse move
+            // would spend a core showing the same picture with one number
+            // different.  The panel's own drawing is over the frame that is
+            // already there, so it still follows the mouse at full rate.
+            let f2 = window.is_key_down(Key::F2);
+            if f2 && !f2_was {
+                panel.toggle();
+                // the chooser is a view of the rows, so opening the panel is the
+                // moment to take a fresh reading of what the machine is set to
+                if panel.open {
+                    sync_preset_row(&mut panel.rows);
+                }
+                dirty = true;
+            }
+            f2_was = f2;
+
+            // The keyboard's side of the panel.  The pump turns the four
+            // navigation keys into panel keys while it is open, and is told to do
+            // so here: the shell beneath must never see an arrow that moved the
+            // selection.  Their own down state is read here too, because a held
+            // key is reported down again on every OS repeat and only the window's
+            // key *state* can tell a repeat from a press.
+            let live = [
+                window.is_key_down(Key::Up),
+                window.is_key_down(Key::Down),
+                window.is_key_down(Key::Enter),
+                window.is_key_down(Key::Escape),
+            ];
+            // The ESC that closed the panel keeps the keyboard to the panel until
+            // it comes back up: those repeats would otherwise reach the shell as
+            // escapes the user meant for the panel.
+            panel_takes_keys = panel.open || (panel_takes_keys && live[3]);
+            term.panel_open = panel_takes_keys;
+            if panel.open {
+                let pos = window
+                    .get_mouse_pos(MouseMode::Discard)
+                    .unwrap_or((0.0, 0.0));
+                let down = window.get_mouse_down(MouseButton::Left);
+                panel.handle(tube.w as usize, tube.h as usize, pos, down, 0.0);
+                if let Some(row) = panel.settle_due(Instant::now()) {
+                    let name = panel.rows[row].name;
+                    // The chooser names the preset through what it *shows*, not
+                    // through its own name, and `custom` - the value past the end
+                    // of the list - names no preset at all, so it applies nothing.
+                    let shown = panel.rows[row].shown();
+                    let preset = if name == "preset" && PRESETS.contains(&shown.as_str()) {
+                        Some(shown)
+                    } else {
+                        None
+                    };
+                    // a preset is several variables at once, so it writes the
+                    // bundle into the panel's own rows and the one mapping below
+                    // applies them - which leaves the panel showing what is set
+                    let rewrite = match &preset {
+                        Some(chosen) => apply_preset_rows(&mut panel.rows, chosen),
+                        None => false,
+                    };
+                    apply_rows(opts, &panel.rows);
+                    // the pen and the slide rates live in the terminal rather than
+                    // in the options.  A preset names them, so they are pushed;
+                    // a single row is only pushed when it is the row that moved, or
+                    // applying the default baud to a terminal started with an
+                    // explicit write rate would quietly change the speed the moment
+                    // the panel was first used.
+                    if preset.is_some() {
+                        if let Some(rate) = opts.write_rate {
+                            term.set_write_rate(rate);
+                        }
+                        term.set_baud(opts.baud);
+                        term.set_slide_rate(opts.slide.unwrap_or(terminal::SLIDE_RATE));
+                        panel.needs_rebuild |= rewrite;
+                    } else {
+                        match name {
+                            "baud" => term.set_baud(opts.baud),
+                            "write-rate" => {
+                                if let Some(rate) = opts.write_rate {
+                                    term.set_write_rate(rate);
+                                }
+                            }
+                            "slide" => {
+                                term.set_slide_rate(opts.slide.unwrap_or(terminal::SLIDE_RATE))
+                            }
+                            _ => {}
+                        }
+                    }
+                    // The chooser is a view of the other rows, so it is recomputed
+                    // after every settle: nudging one variable away from a preset
+                    // is what makes it read `custom`.
+                    sync_preset_row(&mut panel.rows);
+                    // the page follows from the options, so it is rebuilt through
+                    // the same helpers the resize path uses
+                    let cell_now = opts.cell.unwrap_or(terminal::CELL_SCALE_DEFAULT);
+                    let (ww, wh) = window.get_size();
+                    let (cols, rows) = terminal::page_for_window(ww, wh, cell_now);
+                    term.resize(cols, rows);
+                    // The phosphor is configured from the options and one of them,
+                    // --sat, scales a stored chromaticity rather than replacing it,
+                    // so configuring the same tube twice would compound it: every
+                    // pass starts from the parameters the tube was built with.
+                    tube.phosphor = base_phosphor.clone();
+                    configure_terminal_tube(tube, dev, opts, terminal::cell_scale_of(tube.w, cols));
+                    if panel.needs_rebuild {
+                        // the cell size changed: write the page again with the new
+                        // rules rather than leaving the glyphs the old ones drew
+                        term.commit(tube);
+                        panel.needs_rebuild = false;
+                    }
+                    dirty = true;
+                }
+            }
+
             // the wheel reads the scrollback; positive y is a scroll up in minifb
-            if let Some((_, dy)) = window.get_scroll_wheel() {
-                let step = if dy.abs() > 0.0 { (dy * 3.0) as i32 } else { 0 };
-                if step != 0 {
-                    term.scroll_view(step);
+            if !panel.open {
+                if let Some((_, dy)) = window.get_scroll_wheel() {
+                    let step = if dy.abs() > 0.0 { (dy * 3.0) as i32 } else { 0 };
+                    if step != 0 {
+                        term.scroll_view(step);
+                    }
                 }
             }
 
@@ -980,6 +1473,31 @@ fn run_terminal_window(
             };
 
             let changed = term.poll(dt);
+            // The panel keys the pump translated out of this frame's input, acted
+            // on where they are *new*.  A held key arrives again on every OS
+            // repeat, so the edge is the only thing that separates a press from a
+            // key the user is still holding; `nav_was` is that edge.
+            let open_before_keys = panel.open;
+            for k in term.take_panel_keys() {
+                let i = match k {
+                    panel::PanelKey::Up => 0,
+                    panel::PanelKey::Down => 1,
+                    panel::PanelKey::Enter => 2,
+                    panel::PanelKey::Escape => 3,
+                };
+                // `key` reports whether a *row* changed; a selection move needs no
+                // recompose, because the panel is drawn over the frame every frame
+                // while it is open, and a changed value is applied by the settle
+                if !nav_was[i] && panel.key(k, tube.w as usize, tube.h as usize) {
+                    dirty = true;
+                }
+            }
+            nav_was = live;
+            if panel.open != open_before_keys {
+                // Escape closed it, and the buffer the window is showing still has
+                // the panel drawn over the frame: a recompose is what takes it off
+                dirty = true;
+            }
             tube.decay(dt);
             if term.commit_due() {
                 term.commit(tube);
@@ -1011,14 +1529,25 @@ fn run_terminal_window(
             if tube.transients_alive() {
                 dirty = true;
             }
+            let recomposed = dirty;
             if dirty {
                 // one buffer pixel per window pixel: the tube is the window
                 let drew = Instant::now();
-                tube.render_into(&mut buf, 1, 1);
-                window.update_with_buffer(&buf, tube.w as usize, tube.h as usize)?;
+                tube.render_into(&mut frame, 1, 1);
                 drawn_secs += drew.elapsed().as_secs_f32();
-                dirty = false;
                 frames += 1;
+                dirty = false;
+            }
+            if panel.open {
+                // the panel is drawn over a *copy* of the frame and the copy is
+                // uploaded every frame: that is cheap next to a recompose, which
+                // is the half that waits for the dragging to settle
+                buf.clear();
+                buf.extend_from_slice(&frame);
+                panel.draw(&mut buf, tube.w as usize, tube.h as usize, tube);
+                window.update_with_buffer(&buf, tube.w as usize, tube.h as usize)?;
+            } else if recomposed {
+                window.update_with_buffer(&frame, tube.w as usize, tube.h as usize)?;
             } else {
                 window.update();
             }
@@ -1061,11 +1590,11 @@ fn run_window(
     player: &mut Player,
     tw: i32,
     th: i32,
-    opts: &Options,
+    opts: &mut Options,
     start_fullscreen: bool,
     screen: Option<(usize, usize)>,
 ) -> Result<(), Box<dyn Error>> {
-    use minifb::{Key, ScaleMode, Window, WindowOptions};
+    use minifb::{Key, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
     let dev = player.decoder.dev;
     let title = format!(
         "tek-tube - {} {}x{}",
@@ -1075,10 +1604,16 @@ fn run_window(
     );
     let mut fullscreen = start_fullscreen;
     let mut f11_down = false;
+    // The phosphor the tube was built with, taken once.  `--sat` scales a stored
+    // chromaticity rather than replacing it, so a reconfigure has to start from
+    // these parameters or every pass would compound the last one.
+    let base_phosphor = player.tube.phosphor.clone();
     // The fit follows the mode: the monitor at fullscreen, `--shrink` or the
     // device's own scale in a window.  F11 rebuilds the window, as in the
-    // terminal, and the fit is recomputed on the way.
-    let fit = |fullscreen: bool| -> (i32, i32, usize, usize) {
+    // terminal, and the fit is recomputed on the way.  The options are a
+    // parameter rather than captured, because the panel edits them while this
+    // runs.
+    let fit = |fullscreen: bool, opts: &Options| -> (i32, i32, usize, usize) {
         let shrink = match (opts.shrink, if fullscreen { screen } else { None }) {
             (Some(s), _) => s,
             (None, Some((sw, sh))) => fit_shrink(tw, th, (sw, sh)),
@@ -1092,7 +1627,7 @@ fn run_window(
         )
     };
     loop {
-        let (shrink, zoom, ow, oh) = fit(fullscreen);
+        let (shrink, zoom, ow, oh) = fit(fullscreen, opts);
         // In fullscreen the window is the whole monitor and the tube face is placed
         // in the middle of it *without scaling* (ScaleMode::Center): upscaling the
         // buffer to fill a 16:9 screen would soften exactly what the pixel exact
@@ -1123,6 +1658,11 @@ fn run_window(
         )?;
         window.set_target_fps(60);
         let mut buf: Vec<u32> = Vec::new();
+        // The composed frame is kept apart from the presented buffer, as in the
+        // terminal: while the panel is open it is drawn over a *copy* of the frame
+        // every frame, so the panel follows the mouse and the keyboard without
+        // recomposing the tube.
+        let mut frame: Vec<u32> = Vec::new();
         let started = Instant::now();
         let mut last = Instant::now();
         // Recomposing is only needed while something is actually moving: new input
@@ -1130,13 +1670,79 @@ fn run_window(
         // static, so the loop just presents the buffer it already has.
         let mut dirty = true;
         let mut toggle = false;
-        while window.is_open() && !window.is_key_down(Key::Escape) {
+        let mut panel = panel::Panel::new(plot_rows(opts, &player.tube));
+        let mut f2_was = false;
+        // one edge per navigation key, so a held key acts once
+        let mut nav_was = [false; 4];
+        while window.is_open() {
             let down = window.is_key_down(Key::F11);
             if down && !f11_down {
                 toggle = true;
                 break;
             }
             f11_down = down;
+
+            // The options panel, behind F2 as in the terminal.  The keys are read
+            // here rather than through `window_input` because this loop has no
+            // terminal to translate them; each acts on the frame it goes down, so
+            // a held key does not repeat.
+            let f2 = window.is_key_down(Key::F2);
+            if f2 && !f2_was {
+                panel.toggle();
+                dirty = true;
+            }
+            f2_was = f2;
+            let up = window.is_key_down(Key::Up);
+            let arrow_down = window.is_key_down(Key::Down);
+            let enter = window.is_key_down(Key::Enter);
+            let escape = window.is_key_down(Key::Escape);
+            if panel.open {
+                if up && !nav_was[0] && panel.key(panel::PanelKey::Up, ow, oh) {
+                    dirty = true;
+                }
+                if arrow_down && !nav_was[1] && panel.key(panel::PanelKey::Down, ow, oh) {
+                    dirty = true;
+                }
+                if enter && !nav_was[2] && panel.key(panel::PanelKey::Enter, ow, oh) {
+                    dirty = true;
+                }
+            }
+            // ESC quits the window, except when the panel is open: there it closes
+            // the panel, and one press must not do both.
+            if escape && !nav_was[3] {
+                if panel.open {
+                    panel.key(panel::PanelKey::Escape, ow, oh);
+                    dirty = true;
+                } else {
+                    break;
+                }
+            }
+            nav_was = [up, arrow_down, enter, escape];
+            if panel.open {
+                // In fullscreen the buffer is centred in the monitor at 1:1, so the
+                // pointer has to be moved into the buffer's own coordinates before
+                // the panel hit-tests it; in a window the two coincide.
+                let off = (
+                    (win_w as f32 - ow as f32) / 2.0,
+                    (win_h as f32 - oh as f32) / 2.0,
+                );
+                let pos = window
+                    .get_mouse_pos(MouseMode::Discard)
+                    .unwrap_or((0.0, 0.0));
+                let pos = (pos.0 - off.0, pos.1 - off.1);
+                let held = window.get_mouse_down(MouseButton::Left);
+                panel.handle(ow, oh, pos, held, 0.0);
+                if panel.settle_due(Instant::now()).is_some() {
+                    // the panel's rows are the source; the one mapping writes them
+                    // into the options and the tube is configured from those
+                    apply_rows(opts, &panel.rows);
+                    player.tube.phosphor = base_phosphor.clone();
+                    configure_tube(&mut player.tube, dev, opts);
+                    player.set_rate(opts);
+                    dirty = true;
+                }
+            }
+
             let now = Instant::now();
             // The same wall clock as the terminal loop: a clamp here makes the
             // drawing run in slow motion on exactly the slowest frames.
@@ -1145,10 +1751,20 @@ fn run_window(
             if player.advance(dt) || player.tube.transients_alive() {
                 dirty = true;
             }
+            let recomposed = dirty;
             if dirty {
-                player.tube.render_into(&mut buf, shrink, zoom);
-                window.update_with_buffer(&buf, ow, oh)?;
+                player.tube.render_into(&mut frame, shrink, zoom);
                 dirty = false;
+            }
+            if panel.open {
+                // the panel is drawn over a copy of the frame and the copy is
+                // uploaded every frame: cheap next to a recompose
+                buf.clear();
+                buf.extend_from_slice(&frame);
+                panel.draw(&mut buf, ow, oh, &player.tube);
+                window.update_with_buffer(&buf, ow, oh)?;
+            } else if recomposed {
+                window.update_with_buffer(&frame, ow, oh)?;
             } else {
                 window.update();
             }
@@ -1461,7 +2077,8 @@ mod harness {
         let seq = std::env::var("TEK_SEQ").ok();
         let seq_max = env_f32("TEK_SEQ_MAX", 120.0) as usize;
         let trace = std::env::var("TEK_TRACE").is_ok();
-        let until = Instant::now() + std::time::Duration::from_secs_f32(env_f32("TEK_SECONDS", 6.0));
+        let until =
+            Instant::now() + std::time::Duration::from_secs_f32(env_f32("TEK_SECONDS", 6.0));
         let mut n = 0usize;
         while Instant::now() < until {
             frame!();
@@ -1487,7 +2104,13 @@ mod harness {
 
         tube.render_into(&mut buf, 1, 1);
         if let Ok(path) = std::env::var("TEK_PNG") {
-            write_png(&PathBuf::from(&path), &buf, tube.w as usize, tube.h as usize).expect("png");
+            write_png(
+                &PathBuf::from(&path),
+                &buf,
+                tube.w as usize,
+                tube.h as usize,
+            )
+            .expect("png");
         }
         println!(
             "TLOG done: {frames} frames, {:.1} ms a frame, {} commits, {} bytes read, lit {}",
@@ -1575,15 +2198,10 @@ where
             // the measurements settled on (see the README), and any of them can
             // be overridden by a later flag on the same command line.
             "--wyse" => {
-                o.write_rate = Some(0.0); // no beam writer: the glyphs just appear
-                o.slide = Some(0.0); // a screenful lands in one step
-                o.ghost = Some(0.1); // the page before it, fading
-                o.scan = Some(0.5); // the scan's own stripes
-                o.dots = Some(15); // a ROM-ish dot grid
-                o.ambient = Some(0.0); // a black face, not a lit flood field
-                o.trail = Some(0.2); // a short glow: the residual is the ghost
-                o.baud = 19200.0; // a serial link, not a disk
-                o.baud_given = true;
+                // one list, shared with the panel's preset row
+                for (name, v) in WYSE {
+                    apply_value(&mut o, name, *v);
+                }
             }
             "--cell" => o.cell = Some(value("--cell")?.parse()?),
             "--no-autoclear" => o.autoclear = false,
@@ -1654,5 +2272,283 @@ mod tests {
             first,
             last
         );
+    }
+
+    /// Every control the panel offers must have a handler and must survive a
+    /// settle unchanged.  Eight of them started out as sliders that moved a number
+    /// nothing in the terminal read, and a settle that shifted a value on its own
+    /// would make the panel drift the moment it was opened.
+    #[test]
+    fn the_panel_lists_live_variables_only() {
+        let mut opts = Options::default();
+        let tube = Tube::new(1024, 780);
+        let rows = panel_rows(&opts, &tube);
+        assert!(rows.len() >= 20, "the panel lists the terminal's variables");
+        assert_eq!(
+            rows.iter().filter(|r| r.structural).count(),
+            1,
+            "only the cell size needs the page written again"
+        );
+        let structural = apply_rows(&mut opts, &rows);
+        assert!(structural, "the cell row is structural");
+        let again = panel_rows(&opts, &tube);
+        for (a, b) in rows.iter().zip(again.iter()) {
+            assert_eq!(a.name, b.name);
+            assert!(
+                (a.value - b.value).abs() < 1e-3,
+                "{} drifts on a settle: {} -> {}",
+                a.name,
+                a.value,
+                b.value
+            );
+        }
+    }
+
+    /// `--write-rate 0` is an instant page, and the panel has to be able to
+    /// express that: a preset written on the command line - `--wyse` asks for
+    /// exactly this - must be reproducible from the panel, or the panel is a
+    /// second, weaker command line.
+    #[test]
+    fn an_instant_pen_survives_the_panel() {
+        let tube = Tube::new(1024, 780);
+
+        let mut opts = Options::default();
+        opts.write_rate = Some(0.0);
+        let rows = panel_rows(&opts, &tube);
+        let row = rows
+            .iter()
+            .find(|r| r.name == "write-rate")
+            .expect("the row");
+        assert_eq!(row.value, 0.0, "an instant pen reads as zero");
+        apply_rows(&mut opts, &rows);
+        assert_eq!(opts.write_rate, Some(0.0), "and stays instant");
+
+        // with nothing given, the row shows the rate the pen is really running at
+        // rather than a zero that would read as instant
+        let mut fresh = Options::default();
+        let rows = panel_rows(&fresh, &tube);
+        let row = rows
+            .iter()
+            .find(|r| r.name == "write-rate")
+            .expect("the row");
+        assert_eq!(row.value, terminal::WRITE_RATE_DEFAULT);
+        apply_rows(&mut fresh, &rows);
+        assert_eq!(fresh.write_rate, Some(terminal::WRITE_RATE_DEFAULT));
+    }
+
+    /// The whole chain the live harness could not reach - a press, the settle,
+    /// and the options changing - so what is left to a hand test is only whether
+    /// the window delivers a real press at all.  The trace that started this
+    /// showed the settle naming a row the pointer was not over, which is exactly
+    /// what made the two ends worth testing together.
+    #[test]
+    fn a_press_reaches_the_options_through_the_settle() {
+        let mut opts = Options::default();
+        let tube = Tube::new(1024, 780);
+        let mut panel = panel::Panel::new(panel_rows(&opts, &tube));
+        panel.open = true;
+        let (w, h) = (1024usize, 780usize);
+
+        let scan = panel.row_index("scan").expect("the scan row");
+        let (_, y) = panel.row_y(w, h, scan);
+        let x = panel.control_x(h) + panel.track_width(h) * 3 / 4;
+        assert!(panel.handle(w, h, (x as f32, (y + 4) as f32), true, 0.0));
+
+        // nothing is applied while the dragging is fresh
+        assert!(opts.scan.is_none(), "not before the settle");
+        let settled = panel.settle_due(Instant::now() + std::time::Duration::from_millis(400));
+        let row = settled.expect("the settle names the row that moved");
+        assert_eq!(panel.rows[row].name, "scan");
+        apply_rows(&mut opts, &panel.rows);
+        let applied = opts.scan.expect("the option was set");
+        assert!(
+            (applied - 0.71).abs() < 0.05,
+            "three quarters along the 0..0.95 track: {applied}"
+        );
+    }
+
+    /// Build the tube the way a launch does, so the rows that are read from the
+    /// tube (the phosphor, the scan, the ghost, the dot grid) report what a
+    /// configured machine reports rather than a bare `Tube::new`.
+    fn configured(mut tube: Tube, opts: &Options) -> Tube {
+        let cell = opts.cell.unwrap_or(terminal::CELL_SCALE_DEFAULT);
+        configure_terminal_tube(&mut tube, Device::Tek4010, opts, cell);
+        tube
+    }
+
+    /// A preset press sets the rows it names, and the values that follow from
+    /// them.  `wyse` asks for an instant page *and* a paced link, which sounds
+    /// contradictory until the terminal's two rates are told apart.
+    #[test]
+    fn a_preset_sets_the_rows_it_names() {
+        let mut opts = Options::default();
+        let mut tube = configured(Tube::new(1024, 780), &opts);
+        let mut rows = panel_rows(&opts, &tube);
+
+        assert!(
+            !apply_preset_rows(&mut rows, "wyse"),
+            "wyse leaves the cell alone, so the page stands"
+        );
+        apply_rows(&mut opts, &rows);
+        tube = configured(tube, &opts);
+        // the settle recomputes the chooser after applying, and so must the test
+        // if it is to compare against rows the machine is really set to
+        sync_preset_row(&mut rows);
+
+        let row = |name: &str| rows.iter().find(|r| r.name == name).expect("the row").value;
+        assert_eq!(row("write-rate"), 0.0, "no beam writer");
+        assert_eq!(row("scan"), 0.5);
+        assert_eq!(row("dots"), 15.0);
+        assert_eq!(row("ambient"), 0.0);
+        assert_eq!(row("ghost"), 0.1);
+        assert_eq!(row("trail"), 0.2);
+        assert_eq!(row("slide"), 0.0);
+        assert_eq!(row("baud"), 19200.0);
+        assert_eq!(opts.write_rate, Some(0.0), "the page appears, not paced");
+        assert!(
+            opts.baud_given,
+            "and the link is paced, which --wyse has to ask for"
+        );
+
+        // the panel is now showing what the reconfigured machine is set to
+        for r in panel_rows(&opts, &tube) {
+            assert!(
+                (r.value - row(r.name)).abs() < 1e-6,
+                "{} reads {} not {}",
+                r.name,
+                r.value,
+                row(r.name)
+            );
+        }
+    }
+
+    /// The chooser is derived from the rows, never stored: a fresh machine is the
+    /// `tek` defaults, a machine set to either preset reads that preset, and one
+    /// value nudged away from a preset reads `custom`.  The whole point is that
+    /// the row cannot lie about what the machine is set to.
+    #[test]
+    fn the_preset_chooser_reads_the_rows_it_is_derived_from() {
+        let shown = |rows: &[panel::Row]| {
+            rows.iter()
+                .find(|r| r.name == "preset")
+                .expect("the row")
+                .shown()
+        };
+        let mut opts = Options::default();
+        let mut tube = configured(Tube::new(1024, 780), &opts);
+        let mut rows = panel_rows(&opts, &tube);
+
+        assert_eq!(
+            preset_index(&rows),
+            1,
+            "a fresh machine is the tek defaults"
+        );
+        assert_eq!(shown(&rows), "tek");
+
+        // set to each preset in turn
+        apply_preset_rows(&mut rows, "wyse");
+        apply_rows(&mut opts, &rows);
+        tube = configured(tube, &opts);
+        rows = panel_rows(&opts, &tube);
+        assert_eq!(preset_index(&rows), 0);
+        assert_eq!(shown(&rows), "wyse");
+
+        apply_preset_rows(&mut rows, "tek");
+        apply_rows(&mut opts, &rows);
+        tube = configured(tube, &opts);
+        rows = panel_rows(&opts, &tube);
+        assert_eq!(preset_index(&rows), 1);
+        assert_eq!(shown(&rows), "tek");
+
+        // one value off a preset and the machine matches neither of them
+        rows.iter_mut()
+            .find(|r| r.name == "beam")
+            .expect("the beam row")
+            .value = 1.4;
+        assert_eq!(preset_index(&rows), PRESETS.len(), "custom");
+        sync_preset_row(&mut rows);
+        assert_eq!(shown(&rows), "custom");
+    }
+
+    /// The main-side half of a press on the chooser: the preset applied is the one
+    /// the row *shows*, read through the same `shown` name the settle uses, and
+    /// `custom` - the value past the end of the list - is not a preset, so it
+    /// applies nothing.  (The other half, the value moving under the click or the
+    /// Enter key, belongs to the panel.)
+    #[test]
+    fn a_press_on_the_preset_row_applies_that_preset() {
+        let mut opts = Options::default();
+        let tube = configured(Tube::new(1024, 780), &opts);
+        let mut rows = panel_rows(&opts, &tube);
+        assert_eq!(rows[0].name, "preset");
+
+        // the chooser has moved to wyse, so that is the preset that applies
+        rows[0].value = 0.0;
+        let chosen = rows[0].shown();
+        assert_eq!(chosen, "wyse");
+        assert!(
+            !apply_preset_rows(&mut rows, &chosen),
+            "wyse leaves the cell alone, so the page stands"
+        );
+        apply_rows(&mut opts, &rows);
+        assert_eq!(opts.write_rate, Some(0.0), "no beam writer");
+        assert_eq!(opts.scan, Some(0.5));
+        assert!(opts.baud_given, "and the link is paced");
+        // the chooser's own name must be handled, or the settle's guard fires
+        assert!(apply_value(&mut opts, "preset", 1.0), "the name is handled");
+        // and after the settle the chooser reads the machine it produced
+        sync_preset_row(&mut rows);
+        assert_eq!(rows[0].shown(), "wyse");
+
+        // `custom` names no preset, so it applies none of them
+        rows[0].value = PRESETS.len() as f32;
+        assert_eq!(rows[0].shown(), "custom");
+        let chosen = rows[0].shown();
+        let before: Vec<f32> = rows.iter().map(|r| r.value).collect();
+        assert!(!apply_preset_rows(&mut rows, &chosen));
+        assert_eq!(before, rows.iter().map(|r| r.value).collect::<Vec<f32>>());
+    }
+
+    /// `tek` is the field defaults.  The safe way to know it stays that way is to
+    /// compare it against a machine built with nothing given to it.
+    #[test]
+    fn the_tek_preset_is_a_fresh_machine() {
+        let mut opts = Options::default();
+        let tube = configured(Tube::new(1024, 780), &opts);
+        let mut rows = panel_rows(&opts, &tube);
+        // move several rows away from the defaults first
+        for r in rows.iter_mut() {
+            match r.name {
+                "beam" => r.value = 1.4,
+                "scan" => r.value = 0.6,
+                "write-rate" => r.value = 0.0,
+                "cell" => r.value = 3.0,
+                _ => {}
+            }
+        }
+
+        assert!(
+            apply_preset_rows(&mut rows, "tek"),
+            "the cell came back from 3.0, so the page must be written again"
+        );
+        apply_rows(&mut opts, &rows);
+
+        let fresh_opts = Options::default();
+        let fresh_tube = configured(Tube::new(1024, 780), &fresh_opts);
+        for (r, f) in rows.iter().zip(panel_rows(&fresh_opts, &fresh_tube).iter()) {
+            assert_eq!(r.name, f.name);
+            assert!(
+                (r.value - f.value).abs() < 1e-6,
+                "{} is {} where a fresh machine reports {}",
+                r.name,
+                r.value,
+                f.value
+            );
+        }
+
+        // a name that is not a preset does nothing at all
+        let before: Vec<f32> = rows.iter().map(|r| r.value).collect();
+        assert!(!apply_preset_rows(&mut rows, "nope"));
+        assert_eq!(before, rows.iter().map(|r| r.value).collect::<Vec<f32>>());
     }
 }
