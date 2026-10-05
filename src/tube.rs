@@ -336,6 +336,9 @@ pub struct Tube {
     /// Seconds a captured page keeps glowing.  Zero turns the ghost off, which
     /// is what the tube does on its own: charge does not fade.
     pub ghost_tau: f32,
+    /// Cells whose old light has been kept for the ghost: a counter, so a
+    /// headless run can be shown to have taken one.
+    pub ghosted_cells: usize,
 
     /// Scratch for composing a frame (kept to avoid per frame allocation).
     light_buf: Vec<f32>,
@@ -379,6 +382,7 @@ impl Tube {
             ghost: Vec::new(),
             ghost_scale: 0.0,
             ghost_tau: 0.0,
+            ghosted_cells: 0,
             light_buf: Vec::new(),
             fresh_buf: Vec::new(),
             bloom_light: Vec::new(),
@@ -422,6 +426,40 @@ impl Tube {
         self.ghost.clear();
         self.ghost.extend_from_slice(&self.stored);
         self.ghost_scale = 1.0;
+    }
+
+    /// Keep the charge already in one cell, for the cells a commit is about to
+    /// write over.
+    ///
+    /// The whole-page capture above is the page-at-a-time case; this is the other
+    /// half of a raster terminal's behaviour, and the one you see while *typing*:
+    /// a character written over one that was there leaves the old one's light
+    /// behind for a moment.  The value stored is divided by the current scale,
+    /// the same way a beam deposit is, so the cell restarts its fade from here
+    /// rather than inheriting however long the last capture has been decaying.
+    pub fn ghost_cell(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        if self.ghost_tau <= 0.0 {
+            return;
+        }
+        self.ghosted_cells += 1;
+        if self.ghost.len() != self.stored.len() {
+            self.ghost.clear();
+            self.ghost.resize(self.stored.len(), 0.0);
+        }
+        if self.ghost_scale <= 0.0 {
+            self.ghost_scale = 1.0;
+        }
+        let scale = self.ghost_scale;
+        let (tw, th) = (self.w, self.h);
+        for yy in y.max(0)..(y + h).min(th) {
+            for xx in x.max(0)..(x + w).min(tw) {
+                let i = (yy * tw + xx) as usize;
+                let keep = self.stored[i] / scale;
+                if keep > self.ghost[i] {
+                    self.ghost[i] = keep;
+                }
+            }
+        }
     }
 
     /// Exponential decay of the transient populations.  Costs one multiply:
@@ -1625,6 +1663,39 @@ mod tests {
             worst > 20,
             "the scan must band the light, worst row step was {worst}"
         );
+    }
+
+    #[test]
+    fn a_ghost_can_be_taken_of_one_cell() {
+        let lit = |t: &mut Tube| {
+            let mut buf = Vec::new();
+            t.render_into(&mut buf, 1, 1);
+            buf.iter().filter(|p| ((**p >> 8) & 0xff) > 100).count()
+        };
+        let mut t = Tube::new(64, 64);
+        t.ghost_tau = 1.0;
+        for y in 24..40 {
+            for x in 24..40 {
+                t.stored[(y * 64 + x) as usize] = 0.6;
+            }
+        }
+        t.ghost_cell(24, 24, 16, 16);
+        // the charge is gone; only the light it left is still on the face
+        t.clear_stored();
+        assert!(lit(&mut t) > 0, "the cell's own light is still there");
+        t.decay(20.0);
+        assert_eq!(lit(&mut t), 0, "and it fades on its own");
+
+        // and with no ghost asked for, nothing is kept at all
+        let mut off = Tube::new(64, 64);
+        for y in 24..40 {
+            for x in 24..40 {
+                off.stored[(y * 64 + x) as usize] = 0.6;
+            }
+        }
+        off.ghost_cell(24, 24, 16, 16);
+        off.clear_stored();
+        assert_eq!(lit(&mut off), 0, "a storage tube keeps nothing");
     }
 
     #[test]

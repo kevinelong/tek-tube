@@ -1428,12 +1428,13 @@ mod harness {
             frame!();
             if trace {
                 println!(
-                    "TLOG t={:.2} frames={frames} lit={} commits={} bytes_in={} shown={}",
+                    "TLOG t={:.2} frames={frames} lit={} commits={} bytes_in={} shown={} ghosted={}",
                     start.elapsed().as_secs_f32(),
                     lit(&mut tube),
                     term.commits,
                     term.bytes_in,
-                    term.bytes_shown
+                    term.bytes_shown,
+                    tube.ghosted_cells
                 );
             }
             if let (Some(prefix), true) = (&seq, n < seq_max) {

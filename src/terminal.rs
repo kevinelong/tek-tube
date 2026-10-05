@@ -454,6 +454,9 @@ pub struct Terminal {
     pending_scroll: usize,
     /// Rows a second the slide runs at.  Zero makes a scroll jump.
     slide_rate: f32,
+    /// The page as the last commit left it, so the next one can see which cells
+    /// it is writing over.
+    last_screen: Vec<char>,
     /// The writing pen, used only when a write rate is set.
     pen: Pen,
     /// Target dots per second the pen draws at; None writes instantly.
@@ -558,6 +561,7 @@ impl Terminal {
             stop,
             cols,
             rows,
+            last_screen: vec![' '; cols * rows],
             pen: Pen::new(cols * rows),
             page_replaced: false,
             write_rate: Some(WRITE_RATE_DEFAULT),
@@ -842,6 +846,23 @@ impl Terminal {
         changed || sliding || due || pen_work
     }
 
+    /// The character the last commit left in this cell.
+    fn last_char(&self, i: usize) -> char {
+        self.last_screen.get(i).copied().unwrap_or(' ')
+    }
+
+    /// Remember the page as it is now: the next commit compares against this to
+    /// see which cells it is writing over.
+    fn snapshot_screen(&mut self) {
+        if self.last_screen.len() != self.cols * self.rows {
+            self.last_screen.clear();
+            self.last_screen.resize(self.cols * self.rows, ' ');
+        }
+        for i in 0..self.cols * self.rows {
+            self.last_screen[i] = self.screen.visible_char(i % self.cols, i / self.cols);
+        }
+    }
+
     /// Should the caller commit this frame?
     pub fn commit_due(&self) -> bool {
         !self.committed
@@ -885,7 +906,26 @@ impl Terminal {
             // off the phosphor that was in it, which is why a raster terminal's
             // page still glows for a moment after it has been wiped.
             tube.capture_ghost();
+        } else {
+            // An incremental commit writes over cells that held something else.
+            // Each one keeps the light it already had: this is the ghost you see
+            // while typing, and the same one a raster terminal shows when it
+            // writes a character over one that was there.  It is decided by what
+            // the page held at the last commit, not by the pen's record, so it
+            // works the same whether a beam is drawing or not.
+            let cw = (tube.w / self.cols.max(1) as i32).max(1);
+            let ch = (tube.h / self.rows.max(1) as i32).max(1);
+            for i in 0..self.cols * self.rows {
+                let now = self.screen.visible_char(i % self.cols, i / self.cols);
+                if self.last_char(i) != now {
+                    let col = (i % self.cols) as i32;
+                    let row = (i / self.cols) as i32;
+                    tube.ghost_cell(col * cw, tube.h - ch - row * ch, cw, ch);
+                }
+            }
         }
+        // remember the page as it now stands, for the next commit to compare
+        self.snapshot_screen();
         commit_to(tube, &self.screen, &mut self.pen, self.cols, self.rows, traced);
         self.page_replaced = false;
         self.committed = true;
@@ -929,6 +969,8 @@ impl Terminal {
         // beside them.  See `Screen::clear_visible`.
         self.screen.clear_visible();
         self.pen.resize(cols * rows);
+        self.last_screen.clear();
+        self.last_screen.resize(cols * rows, ' ');
         // the record no longer describes this page, so the next poll sees every
         // cell stale and replaces the page whole
         self.page_replaced = true;
