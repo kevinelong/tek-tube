@@ -153,6 +153,15 @@ pub struct InputBatch {
 /// event.  This is a terminal with no bracketed paste, and a doubled Enter on
 /// every press is a far worse trade than that.
 ///
+/// Bracketed paste is not implemented, and deliberately: minifb's window has no
+/// paste of its own - it never reads the clipboard, so a paste is not something
+/// the window can even see - and the one signal that might suggest one, a burst
+/// of character events inside a frame, is indistinguishable from typing, a held
+/// key's repeats or an IME committing a word.  Wrapping a guess would turn
+/// ordinary keystrokes into `ESC [ 200 ~` messes, and the mode only earns its
+/// keep if it is reliable.  This has to be revisited with a real paste source in
+/// front of the window, not guessed from timing.
+///
 /// With `panel_open` the options panel has taken the keyboard: the four
 /// navigation keys come back in `panel_keys` rather than going down the wire, so
 /// moving the panel's selection cannot also move the shell's cursor or run its
@@ -215,6 +224,138 @@ pub fn window_input(
     out
 }
 
+/// The window's mouse for one frame: where the pointer is, which buttons are
+/// down, and how far the wheel turned.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct MouseState {
+    /// The pointer in window pixels, or `None` when it is outside the window.
+    pub pos: Option<(f32, f32)>,
+    pub left: bool,
+    pub middle: bool,
+    pub right: bool,
+    /// Wheel notches this frame, positive up.
+    pub wheel: i32,
+}
+
+/// Wheel notches from the window's own scroll units.
+///
+/// minifb reports the wheel in tenths of a Windows notch - a notch is 120
+/// units, so one notch is 12 here - and a trackpad can report a fraction of
+/// one.  A shell is told about notches and has no way to say "a bit of a
+/// scroll", so a fraction of a notch is still one notch.
+pub fn wheel_notches(dy: f32) -> i32 {
+    if dy == 0.0 {
+        return 0;
+    }
+    ((dy.abs() / 12.0).round() as i32).max(1) * if dy > 0.0 { 1 } else { -1 }
+}
+
+/// Keep a report the encoder produced.  A mode that does not want an event
+/// answers `None`, and there is nothing to send for it.
+fn push_report(out: &mut Vec<Vec<u8>>, report: Option<Vec<u8>>) {
+    if let Some(bytes) = report {
+        out.push(bytes);
+    }
+}
+
+/// Turns the window's per-frame mouse *state* into the *edges* a shell wants.
+///
+/// The shell hears about a press when the button goes down and a release when
+/// it comes up, never once per frame the button is held, or sixty reports a
+/// second would bury it.  Motion is one report per cell the pointer crosses,
+/// and only where the tracking mode asks for it: `mouse_tracks_drag` for a
+/// move with a button down, `mouse_tracks_motion` for a bare move.  A plain
+/// `?1000` application asked for clicks and gets clicks, not a drag report
+/// every time the pointer twitches.
+///
+/// The button state is remembered even on frames where nothing is reported, so
+/// opening the panel or turning a tracking mode on mid-session cannot produce
+/// a phantom edge: the first reported frame compares against what is really
+/// down.
+#[derive(Default)]
+pub struct Mouse {
+    /// Buttons down at the end of the last frame: bit 0 left, 1 middle, 2 right.
+    buttons: u8,
+    /// The cell last seen, so motion is one report per cell crossed rather than
+    /// one per pixel of a slow drag.
+    cell: Option<(usize, usize)>,
+}
+
+impl Mouse {
+    /// One frame's mouse, encoded, in the order it happened.  Empty when no
+    /// tracking mode is on, or while the panel is open - the panel is on top,
+    /// so the click that moved a slider is the panel's and not the shell's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll(
+        &mut self,
+        screen: &vt::Screen,
+        state: MouseState,
+        w: i32,
+        h: i32,
+        cols: usize,
+        rows: usize,
+        panel_open: bool,
+    ) -> Vec<Vec<u8>> {
+        let now = (state.left as u8) | ((state.middle as u8) << 1) | ((state.right as u8) << 2);
+        // The cell under the pointer.  A pointer outside the window is not a
+        // move: reporting it as cell (0, 0) would drag the shell's cursor into
+        // the corner every time the window lost the pointer.
+        let mut moved = false;
+        if let Some((x, y)) = state.pos {
+            let cw = (w.max(1) as f32 / cols.max(1) as f32).max(1.0);
+            let ch = (h.max(1) as f32 / rows.max(1) as f32).max(1.0);
+            let cell = (
+                (x / cw).floor().clamp(0.0, cols.saturating_sub(1) as f32) as usize,
+                (y / ch).floor().clamp(0.0, rows.saturating_sub(1) as f32) as usize,
+            );
+            // The first frame that sees the pointer is not a move: there was no
+            // cell to move from, and calling it one made the click that also
+            // brought the pointer into the window cost a press *and* a drag.
+            moved = self.cell.is_some() && self.cell != Some(cell);
+            self.cell = Some(cell);
+        }
+
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        if !panel_open && screen.wants_mouse() {
+            if let Some((cx, cy)) = self.cell {
+                // the button edges: a press when it goes down, a release when
+                // it comes up, each exactly once
+                for (i, mask) in [(0u8, 1u8), (1, 2), (2, 4)] {
+                    let was = self.buttons & mask != 0;
+                    let is = now & mask != 0;
+                    if is && !was {
+                        push_report(&mut out, screen.mouse_report(i, cx, cy, false, 0));
+                    } else if was && !is {
+                        push_report(&mut out, screen.mouse_report(i, cx, cy, true, 0));
+                    }
+                }
+                // motion, gated by the mode that asked for it.  A drag is a move
+                // with a button already down *before* this frame; a button that
+                // goes down in the same frame went down after the move, so that
+                // move was a bare one.  With a button held the report names it;
+                // bare motion has none.
+                if moved {
+                    if self.buttons != 0 {
+                        if screen.mouse_tracks_drag() {
+                            let button = self.buttons.trailing_zeros() as u8;
+                            push_report(&mut out, screen.mouse_report(button, cx, cy, false, 0));
+                        }
+                    } else if screen.mouse_tracks_motion() {
+                        push_report(&mut out, screen.mouse_report(3, cx, cy, false, 0));
+                    }
+                }
+                // the wheel: one report per notch, not one per frame
+                let step = state.wheel.signum();
+                for _ in 0..state.wheel.abs() {
+                    push_report(&mut out, screen.mouse_report(0, cx, cy, false, step));
+                }
+            }
+        }
+        self.buttons = now;
+        out
+    }
+}
+
 struct WindowInput {
     tx: Sender<Input>,
 }
@@ -243,8 +384,11 @@ pub struct Pen {
     cell: usize,
     seg: usize,
     offset: f32,
-    /// What has already been drawn, so unchanged cells cost nothing.
-    drawn: Vec<char>,
+    /// What has already been drawn, so unchanged cells cost nothing.  The
+    /// reverse flag is part of the record: a reversed cell is a different
+    /// picture from a plain one with the same letter, and a reversed *space* is
+    /// a bar of ink, so it cannot be skipped the way a plain space can.
+    drawn: Vec<(char, bool)>,
     /// Where the beam tip currently is, for the bright spot.
     tip: Option<(f32, f32)>,
     /// Scratch: the current glyph's strokes.
@@ -257,7 +401,7 @@ impl Pen {
             cell: 0,
             seg: 0,
             offset: 0.0,
-            drawn: vec![' '; cells],
+            drawn: vec![(' ', false); cells],
             tip: None,
             segs: Vec::new(),
         }
@@ -265,7 +409,7 @@ impl Pen {
 
     fn resize(&mut self, cells: usize) {
         self.drawn.clear();
-        self.drawn.resize(cells, ' ');
+        self.drawn.resize(cells, (' ', false));
         self.cell = self.cell.min(cells.saturating_sub(1));
         self.seg = 0;
         self.offset = 0.0;
@@ -291,28 +435,51 @@ impl Pen {
             write: Write::Settle,
         };
         for i in 0..cols * rows {
-            let g = self.drawn.get(i).copied().unwrap_or(' ');
-            if g == ' ' {
+            // the pen's own record, including whether it drew the cell in
+            // reverse - a reversed space is a bar, not something to skip
+            let (g, reverse) = self.drawn.get(i).copied().unwrap_or((' ', false));
+            if g == ' ' && !reverse {
                 continue;
             }
             let col = i % cols;
             let row = i / cols;
             let g = crate::tube::glyph_code(g);
             let y = tube.h - ch - (row as f32 * ch as f32).round() as i32;
-            let energy = match screen.visible_attr(col, row) {
+            let attr = screen.visible_attr(col, row);
+            let energy = match attr {
                 vt::Attr::Dim => 0.6,
                 _ => 1.0,
             };
-            tube.character(g, (col as i32 * cw) as f32, y as f32, cw, ch, st, energy);
+            tube.character(
+                g,
+                (col as i32 * cw) as f32,
+                y as f32,
+                cw,
+                ch,
+                st,
+                energy,
+                reverse,
+            );
         }
+    }
+
+    /// What the screen holds in cell `i`, as `drawn` records it: the character
+    /// and whether the cell is reversed.  One place, so `stale`, `sync` and
+    /// `busy` cannot disagree about what "already drawn" means.
+    fn drawn_want(screen: &vt::Screen, i: usize) -> (char, bool) {
+        let (x, y) = (i % screen.cols, i / screen.cols);
+        (
+            screen.visible_char(x, y),
+            matches!(screen.visible_attr(x, y), vt::Attr::Reverse),
+        )
     }
 
     /// How many cells differ from what the pen has drawn.
     pub fn stale(&self, screen: &vt::Screen) -> usize {
         (0..screen.cols * screen.rows)
             .filter(|i| {
-                self.drawn.get(*i).copied().unwrap_or(' ')
-                    != screen.visible_char(i % screen.cols, i / screen.cols)
+                self.drawn.get(*i).copied().unwrap_or((' ', false))
+                    != Self::drawn_want(screen, *i)
             })
             .count()
     }
@@ -321,10 +488,8 @@ impl Pen {
     /// replacement is, and what the pen is told after one.
     pub fn sync(&mut self, screen: &vt::Screen) {
         self.drawn.clear();
-        self.drawn.extend(
-            (0..screen.cols * screen.rows)
-                .map(|i| screen.visible_char(i % screen.cols, i / screen.cols)),
-        );
+        self.drawn
+            .extend((0..screen.cols * screen.rows).map(|i| Self::drawn_want(screen, i)));
         self.cell = 0;
         self.seg = 0;
         self.offset = 0.0;
@@ -337,8 +502,7 @@ impl Pen {
             return true;
         }
         (0..screen.cols * screen.rows).any(|i| {
-            let ch = screen.visible_char(i % screen.cols, i / screen.cols);
-            self.drawn.get(i).copied().unwrap_or(' ') != ch
+            self.drawn.get(i).copied().unwrap_or((' ', false)) != Self::drawn_want(screen, i)
         })
     }
 
@@ -364,18 +528,20 @@ impl Pen {
         while budget > 0.0 && self.cell < cells {
             let col = self.cell % cols;
             let row = self.cell / cols;
-            let g = screen.visible_char(col, row);
-            let g = crate::tube::glyph_code(g);
-            if self.drawn.get(self.cell).copied().unwrap_or(' ') == g as char {
+            let g = crate::tube::glyph_code(screen.visible_char(col, row));
+            let attr = screen.visible_attr(col, row);
+            let reverse = matches!(attr, vt::Attr::Reverse);
+            let want = (g as char, reverse);
+            if self.drawn.get(self.cell).copied().unwrap_or((' ', false)) == want {
                 // nothing to do here; walk on for free
                 self.cell += 1;
                 self.seg = 0;
                 self.offset = 0.0;
                 continue;
             }
-            if g == b' ' {
+            if g == b' ' && !reverse {
                 // erasing is not a stroke: the cell is simply marked as done
-                self.drawn[self.cell] = ' ';
+                self.drawn[self.cell] = (' ', false);
                 self.cell += 1;
                 self.seg = 0;
                 self.offset = 0.0;
@@ -383,21 +549,41 @@ impl Pen {
             }
             // the top of the page is at the top of the target
             let y = tube.h - ch_h - (row as f32 * ch_h as f32).round() as i32;
-            let energy = match screen.visible_attr(col, row) {
+            let energy = match attr {
                 vt::Attr::Dim => 0.6,
                 _ => 1.0,
             };
             self.segs.clear();
-            tube.glyph_strokes(
-                g,
-                (col as i32 * cw) as f32,
-                y as f32,
-                cw,
-                ch_h,
-                |x0, y0, x1, y1| {
-                    self.segs.push((x0, y0, x1, y1));
-                },
-            );
+            // A reversed cell is traced as the stencil, not the glyph: the pen
+            // is what spends the write-rate budget, and drawing the glyph here
+            // while the settle drew bars would be two different pictures of the
+            // same cell - and the bars are exactly the writing that has to be
+            // paced, since they are several times a glyph's ink.  A reversed
+            // space comes through here too: its glyph is empty, so the stencil
+            // fills the cell.
+            if reverse {
+                tube.stencil_strokes(
+                    g,
+                    (col as i32 * cw) as f32,
+                    y as f32,
+                    cw,
+                    ch_h,
+                    |x0, y0, x1, y1| {
+                        self.segs.push((x0, y0, x1, y1));
+                    },
+                );
+            } else {
+                tube.glyph_strokes(
+                    g,
+                    (col as i32 * cw) as f32,
+                    y as f32,
+                    cw,
+                    ch_h,
+                    |x0, y0, x1, y1| {
+                        self.segs.push((x0, y0, x1, y1));
+                    },
+                );
+            }
             let mut finished = true;
             for i in self.seg..self.segs.len() {
                 let (x0, y0, x1, y1) = self.segs[i];
@@ -427,7 +613,7 @@ impl Pen {
             if finished {
                 // the glyph is done: the cell counts as drawn even though its
                 // last dot may not have been reached
-                self.drawn[self.cell] = g as char;
+                self.drawn[self.cell] = want;
                 self.cell += 1;
                 self.seg = 0;
                 self.offset = 0.0;
@@ -485,7 +671,9 @@ pub struct Terminal {
     /// The page as the last *render* left it.  A flash is deposited once, when a
     /// cell changes, and then cools; re-depositing it every frame would hold it
     /// at full brightness until the commit and cost a stroke per cell per frame.
-    flash_screen: Vec<char>,
+    /// The reverse flag is part of the reading: a reversed space is a bar of ink
+    /// and must be told apart from the plain space that leaves nothing.
+    flash_screen: Vec<(char, bool)>,
     /// The writing pen, used only when a write rate is set.
     pen: Pen,
     /// Target dots per second the pen draws at; None writes instantly.
@@ -503,6 +691,9 @@ pub struct Terminal {
     /// The panel keys the last `poll` translated out of the window's input, for
     /// the window loop to act on.  Taken by `take_panel_keys`.
     panel_keys: Vec<panel::PanelKey>,
+    /// The mouse edge tracker: the window hands the frame's state in and this
+    /// turns it into the events a shell asked for (see `Mouse`).
+    mouse: Mouse,
     /// Modifier state, tracked because minifb reports keys, not chords.
     ctrl: bool,
     alt: bool,
@@ -604,7 +795,7 @@ impl Terminal {
             rows,
             last_screen: vec![' '; cols * rows],
             cursor_moved: false,
-            flash_screen: vec![' '; cols * rows],
+            flash_screen: vec![(' ', false); cols * rows],
             pen: Pen::new(cols * rows),
             page_replaced: false,
             write_rate: Some(WRITE_RATE_DEFAULT),
@@ -614,6 +805,7 @@ impl Terminal {
             toggle_fullscreen: false,
             panel_open: false,
             panel_keys: Vec::new(),
+            mouse: Mouse::default(),
             quiet: 0.0,
             since_commit: 0.0,
             committed: false,
@@ -688,6 +880,27 @@ impl Terminal {
     /// read, so one press is handled once; empty unless the panel is open.
     pub fn take_panel_keys(&mut self) -> Vec<panel::PanelKey> {
         std::mem::take(&mut self.panel_keys)
+    }
+
+    /// Report one frame's mouse to the shell when a tracking mode is on.
+    ///
+    /// The window loop reads minifb's mouse state - the keys path cannot carry
+    /// it, since minifb's callback reports keys and characters only - and hands
+    /// the frame in here, where the edges are worked out and written to the pty
+    /// (see `Mouse`).  The panel is on top: while it is open the mouse is the
+    /// panel's and nothing is reported.
+    pub fn report_mouse(&mut self, state: MouseState, w: i32, h: i32, panel_open: bool) {
+        let (cols, rows) = (self.cols, self.rows);
+        let reports = self
+            .mouse
+            .poll(&self.screen, state, w, h, cols, rows, panel_open);
+        if reports.is_empty() {
+            return;
+        }
+        for bytes in &reports {
+            let _ = self.writer.write_all(bytes);
+        }
+        let _ = self.writer.flush();
     }
 
     /// Is the pen still tracing?
@@ -1033,10 +1246,11 @@ impl Terminal {
     fn snapshot_flash(&mut self) {
         if self.flash_screen.len() != self.cols * self.rows {
             self.flash_screen.clear();
-            self.flash_screen.resize(self.cols * self.rows, ' ');
+            self.flash_screen.resize(self.cols * self.rows, (' ', false));
         }
         for i in 0..self.cols * self.rows {
-            self.flash_screen[i] = self.screen.visible_char(i % self.cols, i / self.cols);
+            let want = Pen::drawn_want(&self.screen, i);
+            self.flash_screen[i] = want;
         }
     }
 
@@ -1068,7 +1282,7 @@ impl Terminal {
         self.last_screen.clear();
         self.last_screen.resize(cols * rows, ' ');
         self.flash_screen.clear();
-        self.flash_screen.resize(cols * rows, ' ');
+        self.flash_screen.resize(cols * rows, (' ', false));
         // the record no longer describes this page, so the next poll sees every
         // cell stale and replaces the page whole
         self.page_replaced = true;
@@ -1121,19 +1335,31 @@ pub fn stroke_screen(
         for c in 0..cols {
             // the *view*, which may be scrolled back into the history
             let g = screen.visible_char(c, r);
-            if g == ' ' {
+            // SGR brightness: a storage tube cannot go above full charge, so
+            // "bright" is the ordinary level and only "dim" is expressible
+            let attr = screen.visible_attr(c, r);
+            let reverse = matches!(attr, vt::Attr::Reverse);
+            // a reversed space is a bar of ink, not an empty cell
+            if g == ' ' && !reverse {
                 continue;
             }
             // the stroke font is ASCII; anything else draws as '?' rather than
             // silently vanishing
             let glyph = crate::tube::glyph_code(g);
-            // SGR brightness: a storage tube cannot go above full charge, so
-            // "bright" is the ordinary level and only "dim" is expressible
-            let energy = match screen.visible_attr(c, r) {
+            let energy = match attr {
                 vt::Attr::Dim => 0.6,
                 _ => 1.0,
             };
-            tube.character(glyph, (c as i32 * cw) as f32, y as f32, cw, ch, st, energy);
+            tube.character(
+                glyph,
+                (c as i32 * cw) as f32,
+                y as f32,
+                cw,
+                ch,
+                st,
+                energy,
+                reverse,
+            );
         }
     }
     if cursor {
@@ -1182,7 +1408,7 @@ pub fn commit_to(
 /// the stored image.
 pub fn stroke_changed(
     screen: &vt::Screen,
-    last: &[char],
+    last: &[(char, bool)],
     cols: usize,
     rows: usize,
     tube: &mut Tube,
@@ -1203,18 +1429,30 @@ pub fn stroke_changed(
         }
         for c in 0..cols {
             let g = screen.visible_char(c, r);
-            if g == ' ' {
+            let attr = screen.visible_attr(c, r);
+            let reverse = matches!(attr, vt::Attr::Reverse);
+            // a reversed space is a bar of ink, not an empty cell
+            if g == ' ' && !reverse {
                 continue;
             }
-            if last.get(r * cols + c).copied().unwrap_or(' ') == g {
+            if last.get(r * cols + c).copied().unwrap_or((' ', false)) == (g, reverse) {
                 continue;
             }
             let glyph = crate::tube::glyph_code(g);
-            let energy = match screen.visible_attr(c, r) {
+            let energy = match attr {
                 vt::Attr::Dim => 0.6,
                 _ => 1.0,
             };
-            tube.character(glyph, (c as i32 * cw) as f32, y as f32, cw, ch, st, energy);
+            tube.character(
+                glyph,
+                (c as i32 * cw) as f32,
+                y as f32,
+                cw,
+                ch,
+                st,
+                energy,
+                reverse,
+            );
         }
     }
     if cursor {
@@ -1405,6 +1643,138 @@ mod tests {
         // and keys we have no mapping for
         assert_eq!(key_sequence(Key::LeftShift, false, false, false), None);
         assert_eq!(key_sequence(Key::NumPad5, false, false, false), None);
+    }
+
+    /// A screen with a mouse tracking mode already switched on, as the parser
+    /// would leave it.
+    fn mouse_screen(mode: &[u8]) -> crate::vt::Screen {
+        let mut screen = crate::vt::Screen::new(20, 5);
+        let mut parser = crate::vt::Parser::new();
+        parser.feed(mode, &mut screen);
+        screen
+    }
+
+    /// A press and a release are each one report, and motion is one report per
+    /// cell crossed and only in the modes that asked for it.  A plain `?1000`
+    /// application that heard a drag would move a selection the user never
+    /// dragged, and one that heard a report every frame a button was held would
+    /// be buried.  (Press and release are two reports in every tracking mode -
+    /// xterm reports the release in all of them; what the drag modes add is the
+    /// motion between them.)
+    #[test]
+    fn a_press_and_release_report_two_events_and_only_a_drag_mode_reports_motion() {
+        let press = MouseState {
+            pos: Some((5.0, 5.0)),
+            left: true,
+            ..MouseState::default()
+        };
+        let drag = MouseState {
+            pos: Some((30.0, 5.0)),
+            left: true,
+            ..MouseState::default()
+        };
+        let release = MouseState {
+            pos: Some((30.0, 5.0)),
+            ..MouseState::default()
+        };
+        // 100 px over 20 columns is a five pixel cell, so x 5 and x 30 are
+        // different cells and the move is a real one
+        let screen = mouse_screen(b"\x1b[?1002h");
+        let mut mouse = Mouse::default();
+        assert_eq!(
+            mouse.poll(&screen, press, 100, 60, 20, 5, false).len(),
+            1,
+            "the press"
+        );
+        assert_eq!(
+            mouse.poll(&screen, drag, 100, 60, 20, 5, false).len(),
+            1,
+            "the drag"
+        );
+        assert_eq!(
+            mouse.poll(&screen, release, 100, 60, 20, 5, false).len(),
+            1,
+            "the release"
+        );
+
+        // ?1000 hears the same two edges and nothing else
+        let screen = mouse_screen(b"\x1b[?1000h");
+        let mut mouse = Mouse::default();
+        assert_eq!(
+            mouse.poll(&screen, press, 100, 60, 20, 5, false).len(),
+            1,
+            "the press"
+        );
+        assert_eq!(
+            mouse.poll(&screen, drag, 100, 60, 20, 5, false).len(),
+            0,
+            "a click mode drops the motion it never asked for"
+        );
+        assert_eq!(
+            mouse.poll(&screen, release, 100, 60, 20, 5, false).len(),
+            1,
+            "the release"
+        );
+    }
+
+    /// The panel is on top: while it is open the mouse is its own, and a button
+    /// it took is not reported to the shell as a fresh press on the frame after
+    /// it closes.
+    #[test]
+    fn the_mouse_path_is_silent_while_the_panel_is_open() {
+        let screen = mouse_screen(b"\x1b[?1002h");
+        let mut mouse = Mouse::default();
+        let down = MouseState {
+            pos: Some((5.0, 5.0)),
+            left: true,
+            ..MouseState::default()
+        };
+        assert!(
+            mouse.poll(&screen, down, 100, 60, 20, 5, true).is_empty(),
+            "the panel owns the mouse"
+        );
+        assert!(
+            mouse.poll(&screen, down, 100, 60, 20, 5, false).is_empty(),
+            "the button was already down, so closing the panel is not a press"
+        );
+        let up = MouseState {
+            pos: Some((5.0, 5.0)),
+            ..MouseState::default()
+        };
+        assert_eq!(
+            mouse.poll(&screen, up, 100, 60, 20, 5, false).len(),
+            1,
+            "the release is the first thing the shell hears"
+        );
+    }
+
+    /// A wheel notch is one report, whatever the frame rate, and the fraction of
+    /// a notch a trackpad sends is still a notch - there is no way for a shell
+    /// to say "a bit of a scroll", so it rounds up.
+    #[test]
+    fn the_wheel_reports_one_event_per_notch() {
+        let screen = mouse_screen(b"\x1b[?1000h");
+        let mut mouse = Mouse::default();
+        let up = MouseState {
+            pos: Some((5.0, 5.0)),
+            wheel: 1,
+            ..MouseState::default()
+        };
+        assert_eq!(
+            mouse.poll(&screen, up, 100, 60, 20, 5, false).len(),
+            1,
+            "one notch, one report"
+        );
+        assert_eq!(
+            mouse.poll(&screen, up, 100, 60, 20, 5, false).len(),
+            1,
+            "the next notch is the next report"
+        );
+        assert_eq!(wheel_notches(12.0), 1);
+        assert_eq!(wheel_notches(24.0), 2);
+        assert_eq!(wheel_notches(-12.0), -1);
+        assert_eq!(wheel_notches(3.0), 1);
+        assert_eq!(wheel_notches(0.0), 0);
     }
 
     /// One press of Enter reaches the window twice - Windows sends `WM_KEYDOWN`
@@ -1823,9 +2193,7 @@ mod tests {
         let mut screen = vt::Screen::new(20, 4);
         let mut parser = vt::Parser::new();
         parser.feed(b"one\r\ntwo\r\nthree", &mut screen);
-        let before: Vec<char> = (0..80)
-            .map(|i| screen.visible_char(i % 20, i / 20))
-            .collect();
+        let before: Vec<(char, bool)> = (0..80).map(|i| Pen::drawn_want(&screen, i)).collect();
         let whole = {
             let mut t = Tube::new(512, 256);
             stroke_screen(&screen, 20, 4, &mut t, Write::Flash, false);
@@ -1872,7 +2240,7 @@ mod tests {
             defocus: false,
             write: Write::Flash,
         };
-        tube.character(b'e', 300.0, 700.0, 20, 30, flash, 1.0);
+        tube.character(b'e', 300.0, 700.0, 20, 30, flash, 1.0, false);
         assert!(
             glow_pixels(&mut tube) > 0,
             "the erased glyph should still be glowing"
@@ -1949,7 +2317,7 @@ mod tests {
         // finish it: now a settle during the trace *must* store something, even
         // though the pen is still busy with the rest of the screen
         let mut guard = 0;
-        while pen.drawn.first().copied().unwrap_or(' ') == ' ' && guard < 400 {
+        while pen.drawn.first().copied().unwrap_or((' ', false)) == (' ', false) && guard < 400 {
             pen.advance(3.0, &screen, &mut tube, 20, 4);
             guard += 1;
         }

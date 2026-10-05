@@ -76,7 +76,12 @@ struct Metrics {
 /// A key the panel understands.  The caller maps its window's keys onto these,
 /// so the panel itself never learns about the window system.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PanelKey { Up, Down, Enter, Escape }
+pub enum PanelKey {
+    Up,
+    Down,
+    Enter,
+    Escape,
+}
 
 /// What a caller did to a row.  Both the mouse and the keyboard arrive at
 /// `press` carrying one of these, so a control cannot step one way under the
@@ -167,13 +172,16 @@ impl Panel {
     }
 
     /// The row with this name, for callers that work in names rather than
-    /// indices.
+    /// indices.  The panel's own tests and the composition test in main.rs use
+    /// these; the running loop works in indices and reads the pointer instead.
+    #[allow(dead_code)]
     pub fn row_index(&self, name: &str) -> Option<usize> {
         self.rows.iter().position(|r| r.name == name)
     }
 
     /// How wide a slider's track - and a list's control, which is the same
     /// rectangle - is.
+    #[allow(dead_code)]
     pub fn track_width(&self, h: usize) -> i32 {
         self.metrics(h).track_w
     }
@@ -263,8 +271,20 @@ impl Panel {
                 // caller parks a row there.
                 let cur = (self.rows[i].value as usize).min(n);
                 let next = match act {
-                    Act::Wheel(d) if d < 0.0 => if cur == 0 { n - 1 } else { cur - 1 },
-                    _ => if cur + 1 >= n { 0 } else { cur + 1 },
+                    Act::Wheel(d) if d < 0.0 => {
+                        if cur == 0 {
+                            n - 1
+                        } else {
+                            cur - 1
+                        }
+                    }
+                    _ => {
+                        if cur + 1 >= n {
+                            0
+                        } else {
+                            cur + 1
+                        }
+                    }
                 };
                 if self.rows[i].value != next as f32 {
                     self.rows[i].value = next as f32;
@@ -279,7 +299,10 @@ impl Panel {
         changed
     }
 
-    /// Which row the keyboard is on.
+    /// Which row the keyboard is on.  The panel's own tests read this; the
+    /// running loop does not need it yet, because the highlight is drawn from the
+    /// same field the keys move.
+    #[allow(dead_code)]
     pub fn selected(&self) -> usize {
         self.selected
     }
@@ -725,7 +748,11 @@ mod tests {
         p.key(PanelKey::Enter, W, H);
         assert_eq!(p.rows[0].shown(), "simplex");
         p.key(PanelKey::Enter, W, H);
-        assert_eq!(p.rows[0].shown(), "mono", "the last entry wraps to the first");
+        assert_eq!(
+            p.rows[0].shown(),
+            "mono",
+            "the last entry wraps to the first"
+        );
 
         // a click in the list's control is the same step as Enter
         let cx = p.control_x(H);

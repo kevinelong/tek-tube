@@ -1454,13 +1454,30 @@ fn run_terminal_window(
                 }
             }
 
+            // The window's mouse.  The shell hears about it only when a program
+            // has asked for it (DECSET 1000/1002/1003), which `report_mouse`
+            // decides from the screen; while the panel is open the mouse is the
+            // panel's and nothing is reported.  The wheel is read once here and
+            // used twice: it is the shell's when a tracking mode owns the mouse,
+            // and the scrollback's when it does not.
+            let wheel = window.get_scroll_wheel().map(|(_, dy)| dy).unwrap_or(0.0);
+            let mouse = terminal::MouseState {
+                pos: window.get_mouse_pos(MouseMode::Discard),
+                left: window.get_mouse_down(MouseButton::Left),
+                middle: window.get_mouse_down(MouseButton::Middle),
+                right: window.get_mouse_down(MouseButton::Right),
+                wheel: terminal::wheel_notches(wheel),
+            };
+            term.report_mouse(mouse, tube.w, tube.h, panel.open);
             // the wheel reads the scrollback; positive y is a scroll up in minifb
-            if !panel.open {
-                if let Some((_, dy)) = window.get_scroll_wheel() {
-                    let step = if dy.abs() > 0.0 { (dy * 3.0) as i32 } else { 0 };
-                    if step != 0 {
-                        term.scroll_view(step);
-                    }
+            if !panel.open && !term.screen.wants_mouse() {
+                let step = if wheel.abs() > 0.0 {
+                    (wheel * 3.0) as i32
+                } else {
+                    0
+                };
+                if step != 0 {
+                    term.scroll_view(step);
                 }
             }
 

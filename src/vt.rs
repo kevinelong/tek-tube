@@ -37,6 +37,10 @@ pub enum Attr {
     Dim,
     Normal,
     Bright,
+    /// SGR 7 reverse video.  A storage tube has no second colour to swap in, so
+    /// there is nothing to draw; the attribute is tracked anyway because SGR 27
+    /// has to clear exactly this and not the rest of the state.
+    Reverse,
 }
 
 /// The state `ESC 7` saves and `ESC 8` puts back (DECSC/DECRC).
@@ -80,6 +84,27 @@ pub struct Screen {
     attr_now: Attr,
     /// Set when the cursor is in the pending-wrap state after filling the line.
     pending_wrap: bool,
+    /// Which columns a TAB stops on.  The default is every eighth column; `ESC
+    /// H` adds a stop and `CSI g` removes one or all.  A program that lays out
+    /// its own columns (a form, a table) relies on these, so the default grid
+    /// alone is not enough.
+    tabs: Vec<bool>,
+    /// Origin mode (DECOM, `CSI ?6 h`): CUP and VPA rows count from the top of
+    /// the scroll region rather than the page, which is how a full-screen
+    /// program keeps its drawing inside its own region.
+    origin: bool,
+    /// Mouse tracking mode: 0 off, 1 = `?1000` (press/release), 2 = `?1002`
+    /// (adds drag), 3 = `?1003` (adds bare motion).
+    mouse_mode: u8,
+    /// Report the mouse in SGR (`?1006`) rather than the legacy X10 bytes.
+    mouse_sgr: bool,
+    /// Bracketed paste (`?2004`): the key path wraps a paste in
+    /// `ESC [ 200 ~` / `ESC [ 201 ~` when this is set.
+    bracketed_paste_mode: bool,
+    /// Per row: (double width, double height) from `ESC # 3/4/5/6`.  Recorded
+    /// because the sequence must be consumed rather than printed; the renderer
+    /// decides what to draw, and today it draws nothing special.
+    double_line: Vec<(bool, bool)>,
     /// Lines that have scrolled off the top, oldest first.  A storage tube has
     /// no memory of these - showing them is a deliberate convenience, and the
     /// renderer is what decides whether to show the live page or the history.
@@ -113,12 +138,15 @@ impl Screen {
     /// Apply a charset designator: `0` selects the DEC special graphics set the
     /// line-drawing characters live in, `B` selects ASCII.  The other sets a
     /// designator can name (UK, the national variants) differ from ASCII in one
-    /// or two glyphs this face does not draw, so they are treated as ASCII.
+    /// or two glyphs this face does not draw, so they are treated as ASCII.  The
+    /// designator is consumed for all four slots either way: leaving `ESC ( A`
+    /// to print would put a stray "A" in the output.
     pub fn set_charset(&mut self, slot: u8, designator: u8) {
         let acs = designator == b'0';
         match slot {
             0 => self.g0_acs = acs,
             1 => self.g1_acs = acs,
+            // G2/G3 are eaten here too; nothing shifts them into use.
             _ => {}
         }
     }
@@ -175,6 +203,12 @@ impl Screen {
             },
             attr_now: Attr::Normal,
             pending_wrap: false,
+            tabs: (0..cols).map(|i| i % 8 == 0).collect(),
+            origin: false,
+            mouse_mode: 0,
+            mouse_sgr: false,
+            bracketed_paste_mode: false,
+            double_line: vec![(false, false); rows],
             history: std::collections::VecDeque::new(),
             view: 0,
             alt_saved: None,
@@ -230,6 +264,105 @@ impl Screen {
 
     pub fn in_alt_screen(&self) -> bool {
         self.alt_saved.is_some()
+    }
+
+    /// Any mouse tracking mode currently on.  The key path asks before it turns
+    /// mouse events into sequences.
+    pub fn wants_mouse(&self) -> bool {
+        self.mouse_mode != 0
+    }
+
+    /// Whether the tracking mode reports motion while a button is held (DECSET
+    /// 1002 or 1003), as opposed to presses and releases alone (1000).  The
+    /// caller needs this: `mouse_report` is handed an event, not a verdict on
+    /// whether the mode wanted that event, so without it a drag would be
+    /// reported in a mode that never asked for one.
+    pub fn mouse_tracks_drag(&self) -> bool {
+        self.mouse_mode >= 2
+    }
+
+    /// Whether bare motion - no button down - is reported too (DECSET 1003).
+    pub fn mouse_tracks_motion(&self) -> bool {
+        self.mouse_mode >= 3
+    }
+
+    /// Whether the application asked for pasted text to be bracketed (DECSET
+    /// 2004), so a paste cannot be mistaken for a burst of typed input.
+    ///
+    /// Unused by the input path on purpose.  There is nothing to wrap: minifb has
+    /// no clipboard support at all, so a paste never reaches this window, and the
+    /// one signal that might suggest one - a burst of characters in a frame - is
+    /// indistinguishable from key auto-repeat or an IME commit.  The state is
+    /// still worth keeping: it is what an application asks for, and the day the
+    /// window gains a real paste source this is what it consults.
+    #[allow(dead_code)]
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste_mode
+    }
+
+    /// Recorded from `ESC # 3/4/5/6` and not yet acted on: the renderer draws no
+    /// special width or height for such a line, so this is the state a renderer
+    /// would read rather than a feature that is finished.  Kept because the
+    /// sequences are consumed rather than printed, and dropping the state would
+    /// mean dropping the record of what the program asked for.
+    #[allow(dead_code)]
+    pub fn line_double(&self, y: usize) -> (bool, bool) {
+        self.double_line.get(y).copied().unwrap_or((false, false))
+    }
+
+    /// One mouse event as the tracking mode asks for it, or `None` when no mode
+    /// is on.
+    ///
+    /// The two encodings differ in more than syntax.  X10 (`ESC [ M`) has no
+    /// room for a real release, so any release is button 3, and every byte is
+    /// biased by 32 because the coordinates have to stay 7-bit.  SGR (`?1006`)
+    /// writes the real button and separates press from release with the final
+    /// `M`/`m`.
+    ///
+    /// `button` is 0 left, 1 middle, 2 right; 3 is the report with no button
+    /// held, i.e. bare motion.  The frozen signature has no separate motion
+    /// flag, so the only motion a mode can be asked to filter is that sentinel:
+    /// a drag arrives looking exactly like a press and is accepted by every
+    /// mode, and `?1002` and `?1003` therefore encode identically through this
+    /// interface.  What `?1000` refuses is the held-nothing motion.
+    pub fn mouse_report(
+        &self,
+        button: u8,
+        x: usize,
+        y: usize,
+        release: bool,
+        wheel: i32,
+    ) -> Option<Vec<u8>> {
+        let mode = self.mouse_mode;
+        if mode == 0 {
+            return None;
+        }
+        // a bare motion event: no button held, no release, no wheel
+        if wheel == 0 && !release && button >= 3 && mode < 2 {
+            return None;
+        }
+        let b: u8 = if wheel > 0 {
+            64
+        } else if wheel < 0 {
+            65
+        } else {
+            button.min(3)
+        };
+        // coordinates leave here one-based; the caller works in cells
+        let cx = (x + 1).min(223) as u8;
+        let cy = (y + 1).min(223) as u8;
+        if self.mouse_sgr {
+            let mut out = Vec::with_capacity(16);
+            out.extend_from_slice(b"\x1b[<");
+            out.extend_from_slice(format!("{};{};{}", b, cx, cy).as_bytes());
+            out.push(if release { b'm' } else { b'M' });
+            Some(out)
+        } else {
+            // X10: a release is button 3 whatever button it was, and the button
+            // and both coordinates all carry a +32 bias.
+            let cb = if release { 3 } else { b };
+            Some(vec![0x1b, b'[', b'M', 32 + cb, 32 + cx, 32 + cy])
+        }
     }
 
     /// Map a row of the view to what it shows: `true` and a history index, or
@@ -463,6 +596,10 @@ impl Screen {
         self.saved.cx = self.saved.cx.min(cols - 1);
         self.saved.cy = self.saved.cy.min(rows - 1);
         self.pending_wrap = false;
+        // the old stops belonged to the old width, so the grid is rebuilt at
+        // the default; line doubling is keyed by row and starts over too
+        self.tabs = (0..cols).map(|i| i % 8 == 0).collect();
+        self.double_line = vec![(false, false); rows];
     }
 
     /// The whole screen as text, for verification in tests.
@@ -500,6 +637,97 @@ impl Screen {
             self.erase_line(if mode == 1 { 1 } else { 0 });
         }
     }
+
+    /// Set a tab stop at the cursor (`ESC H`).
+    fn set_tab(&mut self) {
+        if let Some(t) = self.tabs.get_mut(self.cx) {
+            *t = true;
+        }
+    }
+
+    /// The next tab stop strictly after `from`.  With none ahead a tab runs to
+    /// the right margin, which is what the hardware does and what a program
+    /// that cleared every stop is asking for.
+    fn next_tab(&self, from: usize) -> usize {
+        ((from + 1)..self.cols)
+            .find(|&x| self.tabs[x])
+            .unwrap_or(self.cols - 1)
+    }
+
+    /// The previous tab stop strictly before `from`, or column 0 when there is
+    /// none - the left margin.
+    fn prev_tab(&self, from: usize) -> usize {
+        (0..from).rev().find(|&x| self.tabs[x]).unwrap_or(0)
+    }
+
+    /// `ESC # 3/4/5/6` on the cursor's line.
+    fn set_line_double(&mut self, b: u8) {
+        let v = match b {
+            // DECDHL is double width and double height both; the frozen pair
+            // cannot say which half of the line this is, so the top and the
+            // bottom designators record the same thing.
+            b'3' | b'4' => (true, true),
+            b'5' => (false, false),
+            b'6' => (true, false),
+            _ => return,
+        };
+        if let Some(slot) = self.double_line.get_mut(self.cy) {
+            *slot = v;
+        }
+    }
+
+    /// Scroll the region down by `n`: the exact inverse of `scroll_up`, shifting
+    /// content toward the bottom and blanking the exposed top line.  The line
+    /// pushed off the bottom is discarded rather than saved, because the
+    /// scrollback only ever grows at the bottom.
+    pub fn scroll_down(&mut self, n: usize) {
+        for _ in 0..n {
+            let (top, bottom) = (self.scroll_top, self.scroll_bottom);
+            let width = self.cols;
+            for y in (top + 1..=bottom).rev() {
+                let (dst, src) = (y * width, (y - 1) * width);
+                for x in 0..width {
+                    self.ch[dst + x] = self.ch[src + x];
+                    self.attr[dst + x] = self.attr[src + x];
+                }
+            }
+            for x in 0..width {
+                self.ch[top * width + x] = ' ';
+                self.attr[top * width + x] = Attr::Normal;
+            }
+            for y in top..=bottom {
+                self.touch(y);
+            }
+        }
+        // A downward move cannot ride the committed image - that only slides up
+        // - and it undoes any upward scroll accumulated since the renderer last
+        // asked, so the slide it was promised is taken back here rather than
+        // leaving the image offset by a move that did not happen.
+        self.change = match self.change {
+            PageChange::Scroll(k) if k > n => PageChange::Scroll(k - n),
+            PageChange::Scroll(_) => PageChange::None,
+            other => other,
+        };
+    }
+
+    /// `CSI ! p` (DECSTR): put the modes back where they started without
+    /// touching the page.  A program sends it on exit, so a mode left behind
+    /// would be inherited by the next one; the screen is left alone because the
+    /// shell repaints its prompt from what it believes is already there, and
+    /// erasing under it would make that repaint land on a blank page.
+    fn soft_reset(&mut self) {
+        self.autowrap = true;
+        self.origin = false;
+        self.cursor_visible = true;
+        self.mouse_mode = 0;
+        self.mouse_sgr = false;
+        self.bracketed_paste_mode = false;
+        self.attr_now = Attr::Normal;
+        self.g0_acs = false;
+        self.g1_acs = false;
+        self.gl = 0;
+        self.pending_wrap = false;
+    }
 }
 
 /// Escape-sequence states.  Names follow the usual VT naming.
@@ -512,6 +740,9 @@ enum State {
     /// Collecting a charset designator - `ESC ( 0` and friends.  The payload is
     /// the slot it applies to: 0 = G0, 1 = G1, 2 = G2, 3 = G3.
     Charset(u8),
+    /// The byte after `ESC #`: a line attribute (`# 3/4/5/6`).  It gets its own
+    /// state so the digit is consumed rather than printed.
+    Hash,
 }
 
 pub struct Parser {
@@ -520,6 +751,9 @@ pub struct Parser {
     /// Digits of the parameter being accumulated.
     cur: Option<u16>,
     private: Option<char>,
+    /// The intermediate byte of a CSI, e.g. the `!` of `CSI ! p` (DECSTR).
+    /// Without it a soft reset is indistinguishable from a bare `CSI p`.
+    intermediate: Option<u8>,
     utf8: Vec<u8>,
     /// True once the OSC command number and its ';' have been skipped.
     osc_past_prefix: bool,
@@ -535,6 +769,7 @@ impl Parser {
             params: Vec::new(),
             cur: None,
             private: None,
+            intermediate: None,
             utf8: Vec::new(),
             osc_past_prefix: false,
             replies: Vec::new(),
@@ -587,6 +822,10 @@ impl Parser {
                     s.set_charset(slot, b);
                     self.state = State::Ground;
                 }
+                State::Hash => {
+                    s.set_line_double(b);
+                    self.state = State::Ground;
+                }
             }
         }
         self.take_replies()
@@ -608,10 +847,10 @@ impl Parser {
                 s.pending_wrap = false;
             }
             0x09 => {
-                s.cx = ((s.cx / 8) + 1) * 8;
-                if s.cx >= s.cols {
-                    s.cx = s.cols - 1;
-                }
+                // a tab runs to the next stop the program set, or along the
+                // default every-eighth-column grid when it set none
+                s.cx = s.next_tab(s.cx);
+                s.pending_wrap = false;
             }
             0x07 => self.bell_count += 1,
             // SO and SI shift between G1 and G0.  Programs usually select the
@@ -648,6 +887,7 @@ impl Parser {
                 self.params.clear();
                 self.cur = None;
                 self.private = None;
+                self.intermediate = None;
                 State::Csi
             }
             b']' => {
@@ -665,6 +905,16 @@ impl Parser {
             b')' => State::Charset(1),
             b'*' => State::Charset(2),
             b'+' => State::Charset(3),
+            // `ESC # 3/4/5/6` marks the line's width/height.  The designator is
+            // consumed; before this `ESC # 6` printed its "6" into the line.
+            b'#' => State::Hash,
+            // DECSET/DECRST's tab-set sibling: `ESC H` puts a tab stop at the
+            // cursor, which is the only way a program can lay out its own
+            // columns.
+            b'H' => {
+                s.set_tab();
+                State::Ground
+            }
             b'7' => {
                 s.saved = SavedState {
                     cx: s.cx,
@@ -734,7 +984,7 @@ impl Parser {
                 self.cur = None;
             }
             b'?' | b'>' | b'=' => self.private = Some(b as char),
-            0x20..=0x2f => {} // intermediate bytes
+            0x20..=0x2f => self.intermediate = Some(b), // intermediate bytes
             0x40..=0x7e => {
                 if let Some(c) = self.cur.take() {
                     self.params.push(c);
@@ -760,7 +1010,14 @@ impl Parser {
             b'H' | b'f' => {
                 let row = self.raw(0).max(1) as usize;
                 let col = self.raw(1).max(1) as usize;
-                s.cy = (row - 1).min(s.rows - 1);
+                // with origin mode on, row 1 is the top of the scroll region
+                // and the cursor cannot leave it; the column always counts from
+                // the left edge
+                s.cy = if s.origin {
+                    (s.scroll_top + row - 1).min(s.scroll_bottom)
+                } else {
+                    (row - 1).min(s.rows - 1)
+                };
                 s.cx = (col - 1).min(s.cols - 1);
                 s.pending_wrap = false;
             }
@@ -781,7 +1038,35 @@ impl Parser {
                 s.pending_wrap = false;
             }
             b'G' => s.cx = (self.raw(0).max(1) as usize - 1).min(s.cols - 1),
-            b'd' => s.cy = (self.raw(0).max(1) as usize - 1).min(s.rows - 1),
+            b'd' => {
+                let row = self.raw(0).max(1) as usize;
+                s.cy = if s.origin {
+                    (s.scroll_top + row - 1).min(s.scroll_bottom)
+                } else {
+                    (row - 1).min(s.rows - 1)
+                };
+            }
+            b'I' => {
+                // CHT: forward n tab stops
+                for _ in 0..n {
+                    s.cx = s.next_tab(s.cx);
+                }
+                s.pending_wrap = false;
+            }
+            b'Z' => {
+                // CBT: back n tab stops
+                for _ in 0..n {
+                    s.cx = s.prev_tab(s.cx);
+                }
+                s.pending_wrap = false;
+            }
+            b'g' => match a {
+                // 0: clear the stop under the cursor.  3: clear every stop.
+                // (1 and 2 are the VT52 variants and are not used.)
+                0 => s.tabs[s.cx] = false,
+                3 => s.tabs.iter_mut().for_each(|t| *t = false),
+                _ => {}
+            },
             b'E' => {
                 s.cx = 0;
                 for _ in 0..n {
@@ -838,7 +1123,7 @@ impl Parser {
                 s.touch(s.cy);
             }
             b'S' => s.scroll_up(n),
-            b'T' => {}
+            b'T' => s.scroll_down(n),
             b'r' => {
                 if self.params.is_empty() {
                     // bare `CSI r` resets the region to the whole page
@@ -863,7 +1148,23 @@ impl Parser {
                         0 => s.attr_now = Attr::Normal,
                         1 => s.attr_now = Attr::Bright,
                         2 => s.attr_now = Attr::Dim,
+                        // 4 (underline) and 5 (blink) are swallowed on purpose:
+                        // a storage tube can hold neither, and this model has no
+                        // state for them to turn off again.
+                        4 | 5 => {}
+                        // 7/27 toggle reverse video.  A storage tube cannot show
+                        // it, but the attribute must be tracked so 27 clears the
+                        // right thing and not a brightness the program set.
+                        7 => s.attr_now = Attr::Reverse,
                         22 => s.attr_now = Attr::Normal,
+                        // reverse off only, so a brightness set before it
+                        // survives - the attribute is single-valued, so 27 has
+                        // to be careful not to flatten everything
+                        27 => {
+                            if matches!(s.attr_now, Attr::Reverse) {
+                                s.attr_now = Attr::Normal;
+                            }
+                        }
                         // 38/48 must come before the 30..=49 range that contains
                         // them, or this arm is unreachable
                         38 | 48 => i += 2, // 38;5;n or 38;2;r;g;b
@@ -881,6 +1182,19 @@ impl Parser {
                         1 => s.app_cursor = set,
                         7 => s.autowrap = set,
                         25 => s.cursor_visible = set,
+                        3 => {
+                            // DECCOLM asks for 132 columns.  The page shape is
+                            // the face's own, so the geometry deliberately does
+                            // not change; consuming the sequence is the point,
+                            // because a silent no-op that still printed its "3"
+                            // would be worse than either.
+                        }
+                        6 => s.origin = set,
+                        1000 => s.mouse_mode = if set { 1 } else { 0 },
+                        1002 => s.mouse_mode = if set { 2 } else { 0 },
+                        1003 => s.mouse_mode = if set { 3 } else { 0 },
+                        1006 => s.mouse_sgr = set,
+                        2004 => s.bracketed_paste_mode = set,
                         47 => {
                             // alternate screen, cursor untouched
                             if set {
@@ -919,6 +1233,9 @@ impl Parser {
                 _ => {}
             },
             b'c' => self.replies.extend_from_slice(b"\x1b[?1;2c"),
+            // `CSI ! p` is DECSTR.  The `!` arrives as an intermediate byte; a
+            // bare `CSI p` is not a command we answer, so the guard matters.
+            b'p' if self.intermediate == Some(b'!') => s.soft_reset(),
             _ => {}
         }
     }
@@ -1336,5 +1653,249 @@ mod tests {
             p.feed(&[*b], &mut s);
         }
         assert_eq!(row_text(&s, 0), "→");
+    }
+
+    /// SGR 7/27 toggle reverse video.  Nothing can be drawn on a storage tube,
+    /// but if the attribute were not tracked, 27 could not clear it and a later
+    /// drawing would inherit a state the program had finished with.
+    #[test]
+    fn sgr_reverse_video_is_its_own_attribute() {
+        let (s, _, _) = run(b"\x1b[7mX", 10, 2);
+        assert!(matches!(s.attr_at(0, 0), Attr::Reverse));
+        let (s, _, _) = run(b"\x1b[7m\x1b[27mX", 10, 2);
+        assert!(matches!(s.attr_at(0, 0), Attr::Normal));
+        // 27 removes reverse and nothing else, so a brightness under it stays
+        let (s, _, _) = run(b"\x1b[1m\x1b[27mX", 10, 2);
+        assert!(matches!(s.attr_at(0, 0), Attr::Bright));
+        // and 0 still clears everything, reverse included
+        let (s, _, _) = run(b"\x1b[7m\x1b[0mX", 10, 2);
+        assert!(matches!(s.attr_at(0, 0), Attr::Normal));
+    }
+
+    /// A program that lays out its own columns sets stops with `ESC H`; a TAB
+    /// that always snapped to the eighth-column grid would ignore them and its
+    /// table would drift.
+    #[test]
+    fn a_tab_stop_set_by_the_program_beats_the_default_grid() {
+        let (s, _, _) = run(b"\x1b[1;4H\x1bH\x1b[1;1H\t", 20, 2);
+        assert_eq!(s.cx, 3, "TAB lands on the stop set at column 3, not 8");
+        // clearing the stop at column 8 sends the next TAB on to 16
+        let (s, _, _) = run(b"\x1b[1;9H\x1b[g\x1b[1;1H\t", 20, 2);
+        assert_eq!(s.cx, 16);
+    }
+
+    /// CHT (`CSI I`) and CBT (`CSI Z`) walk several stops at once, forward and
+    /// back; before this the cursor stayed put and the program's alignment was
+    /// lost.
+    #[test]
+    fn cht_and_cbt_walk_whole_stops() {
+        let (s, _, _) = run(b"\x1b[1;1H\x1b[2I", 20, 2);
+        assert_eq!(s.cx, 16, "two stops forward from column 0");
+        let (s, _, _) = run(b"\x1b[1;17H\x1b[2Z", 20, 2);
+        assert_eq!(s.cx, 0, "two stops back from column 16");
+        let (s, _, _) = run(b"\x1b[1;17H\x1b[Z", 20, 2);
+        assert_eq!(s.cx, 8, "one stop back");
+    }
+
+    /// DECOM (`CSI ?6 h`) makes CUP and VPA count rows from the scroll region's
+    /// top.  Without it a full-screen program's `CUP 1;1` lands on the page top
+    /// and draws over its own status line.
+    #[test]
+    fn origin_mode_makes_cup_relative_to_the_scroll_region() {
+        let (s, _, _) = run(b"\x1b[3;6r\x1b[?6h\x1b[1;1H", 20, 8);
+        assert_eq!(s.cy, 2, "row 1 of the region is page row 3");
+        assert_eq!(s.cx, 0);
+        let (s, _, _) = run(b"\x1b[3;6r\x1b[?6h\x1b[99;1H", 20, 8);
+        assert_eq!(s.cy, 5, "clamped to the region's bottom, not the page's");
+        let (s, _, _) = run(b"\x1b[3;6r\x1b[?6h\x1b[2d", 20, 8);
+        assert_eq!(s.cy, 3, "VPA counts from the region too");
+        // with origin off the same CUP is absolute again
+        let (s, _, _) = run(b"\x1b[3;6r\x1b[?6l\x1b[1;1H", 20, 8);
+        assert_eq!(s.cy, 0);
+    }
+
+    /// DECSTR (`CSI ! p`) is what a program sends on its way out.  Every mode
+    /// it leaves behind would be inherited by the next one, and it must not
+    /// touch the page, because the shell repaints from what it believes is
+    /// already on screen.
+    #[test]
+    fn a_soft_reset_clears_the_modes_without_clearing_the_page() {
+        let (s, _, _) = run(
+            b"hello\x1b[?7l\x1b[?6h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[2m\x1b(0\x1b[!p",
+            20,
+            4,
+        );
+        assert!(s.autowrap, "autowrap comes back on");
+        assert!(!s.origin, "origin mode goes off");
+        assert!(s.cursor_visible, "the cursor comes back");
+        assert!(!s.wants_mouse(), "no tracking");
+        assert!(!s.bracketed_paste(), "no bracketed paste");
+        assert!(matches!(s.attr_now, Attr::Normal), "attributes normal");
+        assert!(!s.g0_acs && !s.g1_acs, "both charsets are ASCII again");
+        assert_eq!(s.gl, 0);
+        assert_eq!(row_text(&s, 0), "hello", "and the page is untouched");
+    }
+
+    /// `CSI T` scrolls down, blanking the top line: the exact inverse of the
+    /// scroll-up.  Before this it was swallowed, so a program that scrolled
+    /// down (a menu repositioning, `less` at the top of a file) left the page
+    /// where it was instead of opening the blank line it asked for.
+    #[test]
+    fn scroll_down_is_the_inverse_of_scroll_up() {
+        let mut s = Screen::new(6, 3);
+        let mut p = Parser::new();
+        p.feed(b"one\r\ntwo\r\nthree", &mut s);
+        p.feed(b"\x1b[T", &mut s);
+        assert_eq!(row_text(&s, 0), "", "the exposed top line is blank");
+        assert_eq!(row_text(&s, 1), "one");
+        assert_eq!(row_text(&s, 2), "two", "everything moved down one");
+
+        // the scroll region confines it, as it does for an upward scroll
+        let mut s = Screen::new(6, 4);
+        let mut p = Parser::new();
+        p.feed(b"aaa\r\nbbb\r\nccc\r\nddd", &mut s);
+        p.feed(b"\x1b[2;3r\x1b[T", &mut s);
+        assert_eq!(row_text(&s, 0), "aaa", "outside the region is untouched");
+        assert_eq!(row_text(&s, 1), "");
+        assert_eq!(row_text(&s, 2), "bbb");
+        assert_eq!(row_text(&s, 3), "ddd");
+    }
+
+    /// A scroll down undoes an accumulated scroll up rather than letting the
+    /// renderer slide the committed image for a move that did not happen.
+    #[test]
+    fn a_scroll_down_takes_back_a_scroll_up() {
+        let mut s = Screen::new(6, 3);
+        let mut p = Parser::new();
+        p.feed(b"one\r\ntwo\r\nthree\r\nfour", &mut s);
+        assert_eq!(s.take_page_change(), PageChange::Scroll(1));
+        p.feed(b"\x1b[T", &mut s);
+        assert_eq!(s.take_page_change(), PageChange::None, "the move is undone");
+        assert_eq!(row_text(&s, 0), "");
+        assert_eq!(row_text(&s, 1), "two");
+    }
+
+    /// DECCOLM (`CSI ?3 h`) asks for 132 columns, but the page shape belongs to
+    /// the face.  The geometry must not move - and the sequence must not print
+    /// its "3", which is the bug this guards.
+    #[test]
+    fn the_132_column_mode_is_consumed_without_resizing() {
+        let (s, _, _) = run(b"\x1b[?3h", 20, 4);
+        assert_eq!((s.cols, s.rows), (20, 4), "the page shape is unchanged");
+        assert_eq!(row_text(&s, 0), "", "the parameter must not print");
+        let (s, _, _) = run(b"\x1b[?3l", 20, 4);
+        assert_eq!((s.cols, s.rows), (20, 4));
+        assert_eq!(row_text(&s, 0), "");
+    }
+
+    /// `ESC # 6` marks the line double width.  The renderer may draw nothing
+    /// special, but the designator must never print as a "6" in the line.
+    #[test]
+    fn a_double_width_line_attribute_is_consumed_not_printed() {
+        let (s, _, _) = run(b"ab\x1b#6cd", 10, 2);
+        assert_eq!(row_text(&s, 0), "abcd");
+        assert_eq!(s.line_double(0), (true, false), "double width recorded");
+        // `ESC # 5` puts the line back to normal
+        let (s, _, _) = run(b"\x1b#6\x1b#5", 10, 2);
+        assert_eq!(s.line_double(0), (false, false));
+        // and it is per line: only the cursor's line changes
+        let (s, _, _) = run(b"\x1b#6\x1b[2;1H", 10, 2);
+        assert_eq!(s.line_double(0), (true, false));
+        assert_eq!(s.line_double(1), (false, false));
+    }
+
+    /// The mouse encoder's two formats.  X10 has no release of its own, so it
+    /// says button 3, and biases every byte by 32; SGR keeps the real button
+    /// and uses `m` for the release.  Getting either wrong sends the child a
+    /// click it cannot place.
+    #[test]
+    fn the_mouse_reports_the_bytes_each_encoding_asks_for() {
+        let (s, _, _) = run(b"\x1b[?1000h", 80, 24);
+        assert!(s.wants_mouse());
+        // left press at cell (3,7): Cb 0, Cx 4, Cy 8, each +32
+        assert_eq!(
+            s.mouse_report(0, 3, 7, false, 0).unwrap(),
+            vec![0x1b, b'[', b'M', 32, 36, 40]
+        );
+        // a release in X10 is button 3 whatever button it was
+        assert_eq!(
+            s.mouse_report(0, 3, 7, true, 0).unwrap(),
+            vec![0x1b, b'[', b'M', 35, 36, 40]
+        );
+        // the wheel is buttons 64 (up) and 65 (down)
+        assert_eq!(
+            s.mouse_report(0, 3, 7, false, 1).unwrap(),
+            vec![0x1b, b'[', b'M', 96, 36, 40]
+        );
+        assert_eq!(
+            s.mouse_report(0, 3, 7, false, -1).unwrap(),
+            vec![0x1b, b'[', b'M', 97, 36, 40]
+        );
+        // SGR: `ESC [ < b ; x ; y M` for a press, `m` for a release
+        let (s, _, _) = run(b"\x1b[?1000h\x1b[?1006h", 80, 24);
+        assert_eq!(
+            s.mouse_report(0, 3, 7, false, 0).unwrap(),
+            b"\x1b[<0;4;8M".to_vec()
+        );
+        assert_eq!(
+            s.mouse_report(0, 3, 7, true, 0).unwrap(),
+            b"\x1b[<0;4;8m".to_vec()
+        );
+        assert_eq!(
+            s.mouse_report(0, 3, 7, false, -1).unwrap(),
+            b"\x1b[<65;4;8M".to_vec()
+        );
+    }
+
+    /// Nothing is reported when no tracking mode is on, or after the one that
+    /// was on is turned off; a terminal that kept sending mouse bytes would
+    /// spray escapes into a shell that never asked for them.
+    #[test]
+    fn the_mouse_is_silent_until_a_mode_turns_it_on() {
+        let (s, _, _) = run(b"", 80, 24);
+        assert!(!s.wants_mouse());
+        assert!(s.mouse_report(0, 3, 7, false, 0).is_none());
+        assert!(s.mouse_report(0, 3, 7, false, 1).is_none());
+        let (s, _, _) = run(b"\x1b[?1000h\x1b[?1000l", 80, 24);
+        assert!(!s.wants_mouse());
+        assert!(s.mouse_report(0, 3, 7, false, 0).is_none());
+    }
+
+    /// `?1000` reports presses and releases but not bare motion; `?1002` and
+    /// `?1003` add it.  Motion reaches the encoder as button 3 with no release,
+    /// the only shape the frozen signature can use for it.
+    #[test]
+    fn the_tracking_modes_gate_motion_differently() {
+        let (s, _, _) = run(b"\x1b[?1000h", 80, 24);
+        assert!(s.mouse_report(3, 5, 5, false, 0).is_none(), "no motion");
+        assert!(s.mouse_report(0, 5, 5, false, 0).is_some(), "but a press");
+        assert!(s.mouse_report(0, 5, 5, true, 0).is_some(), "and a release");
+        let (s, _, _) = run(b"\x1b[?1002h", 80, 24);
+        assert!(s.mouse_report(3, 5, 5, false, 0).is_some(), "?1002 adds it");
+        let (s, _, _) = run(b"\x1b[?1003h", 80, 24);
+        assert!(s.mouse_report(3, 5, 5, false, 0).is_some(), "?1003 too");
+    }
+
+    /// `?2004` is bracketed paste: the key path reads it to wrap a paste so a
+    /// shell cannot mistake pasted newlines for typed commands.
+    #[test]
+    fn bracketed_paste_is_a_mode_that_round_trips() {
+        let (s, _, _) = run(b"\x1b[?2004h", 10, 2);
+        assert!(s.bracketed_paste());
+        let (s, _, _) = run(b"\x1b[?2004l", 10, 2);
+        assert!(!s.bracketed_paste());
+        // and it is its own mode: it does not turn the mouse on
+        let (s, _, _) = run(b"\x1b[?2004h", 10, 2);
+        assert!(!s.wants_mouse());
+    }
+
+    /// Every charset slot's designator is consumed, not printed.  Only the
+    /// graphics/ASCII distinction is acted on - the national sets differ by a
+    /// glyph or two this face does not draw - but `ESC ( A` must not leave an
+    /// "A" in the output.
+    #[test]
+    fn every_charset_designator_is_consumed_not_printed() {
+        let (s, _, _) = run(b"\x1b(A\x1b)B\x1b*A\x1b+Bx", 10, 2);
+        assert_eq!(row_text(&s, 0), "x");
     }
 }

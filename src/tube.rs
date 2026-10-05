@@ -954,6 +954,10 @@ impl Tube {
         }
     }
 
+    /// Draw one alpha character, bottom-left of its cell at (x, y).
+    ///
+    /// `reverse` draws the cell the other way round, as a stencil - see
+    /// `stencil_strokes`.
     pub fn character(
         &mut self,
         ch: u8,
@@ -963,18 +967,86 @@ impl Tube {
         cell_h: i32,
         st: Style,
         energy: f32,
+        reverse: bool,
     ) {
         if self.dot_rows > 0 {
-            self.character_dots(ch, x, y, cell_w, cell_h, st, energy);
+            self.character_dots(ch, x, y, cell_w, cell_h, st, energy, reverse);
             return;
         }
         // draws through the same placement helper, so the two cannot drift
         let mut segs: Vec<(f32, f32, f32, f32)> = Vec::new();
+        if reverse {
+            self.stencil_strokes(ch, x, y, cell_w, cell_h, |x0, y0, x1, y1| {
+                segs.push((x0, y0, x1, y1));
+            });
+        } else {
+            self.glyph_strokes(ch, x, y, cell_w, cell_h, |x0, y0, x1, y1| {
+                segs.push((x0, y0, x1, y1));
+            });
+        }
+        for (x0, y0, x1, y1) in segs {
+            self.stroke(x0, y0, x1, y1, st, energy);
+        }
+    }
+
+    /// The strokes that draw `ch`'s cell in inverse: the pen fills the cell and
+    /// the glyph is the hole it leaves.
+    ///
+    /// A storage tube cannot un-write charge, so a bright background with dark
+    /// text in it cannot be made by clearing under the letter - there is no way
+    /// to clear it, and the target's other populations only add light.  It has
+    /// to be *drawn* as a stencil: the bars are inked and the letter is what the
+    /// pen does not write, so the glyph reads as a dark hole in a lit bar.  The
+    /// hole is a stroke and a half wide - three sigma, and the beam deposits
+    /// nothing past 2.6 of them - which is what keeps the bar's own spread from
+    /// closing it back up.  The bar is drawn at every dot row, so the strokes
+    /// merge into a solid fill.
+    ///
+    /// This is a whole cell of ink, not a glyph's worth: `cell_w * cell_h` dots
+    /// against a letter's sixty or so, several times the writing of the text it
+    /// replaces, which is why a reversed status line is a lot of pen.  It goes
+    /// through `stroke` like everything else, so it is counted and paced with
+    /// the rest of the page rather than being a separate kind of writing.
+    pub fn stencil_strokes(
+        &self,
+        ch: u8,
+        x: f32,
+        y: f32,
+        cell_w: i32,
+        cell_h: i32,
+        mut f: impl FnMut(f32, f32, f32, f32),
+    ) {
+        // The glyph's own strokes are the hole, so they are measured here and
+        // never drawn.  The same placement helper as the normal path, so the
+        // hole lands exactly where the glyph would have been.
+        let mut segs: Vec<(f32, f32, f32, f32)> = Vec::new();
         self.glyph_strokes(ch, x, y, cell_w, cell_h, |x0, y0, x1, y1| {
             segs.push((x0, y0, x1, y1));
         });
-        for (x0, y0, x1, y1) in segs {
-            self.stroke(x0, y0, x1, y1, st, energy);
+        let keep2 = (self.sigma * 3.0) * (self.sigma * 3.0);
+        let (x0, y0) = (x.round(), y.round());
+        let cw = cell_w.max(1);
+        let ch_h = cell_h.max(1);
+        for r in 0..ch_h {
+            let py = y0 + r as f32;
+            let mut run: Option<f32> = None;
+            for c in 0..=cw {
+                let px = x0 + c as f32;
+                // the cell's own edge is never part of a run, so a bar stops
+                // there and the next cell's begins - the join is seamless
+                let inked = c < cw
+                    && !segs
+                        .iter()
+                        .any(|&(ax, ay, bx, by)| dist2(px, py, ax, ay, bx, by) <= keep2);
+                match (inked, run) {
+                    (true, None) => run = Some(px),
+                    (false, Some(start)) => {
+                        f(start, py, px, py);
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -995,6 +1067,7 @@ impl Tube {
         cell_h: i32,
         st: Style,
         energy: f32,
+        reverse: bool,
     ) {
         let (gw, gh, bits) = self.raster_glyph(ch, x, y, cell_w, cell_h);
         let baseline = y + cell_h as f32 * GLYPH_BASELINE;
@@ -1009,9 +1082,30 @@ impl Tube {
         let pitch = (top - bottom) / gh as f32;
         let sigma = self.sigma;
         self.sigma = pitch * 0.75;
-        for gy in 0..gh {
-            for gx in 0..gw {
-                if bits[(gy * gw + gx) as usize] {
+        // The inverse on a dot matrix is the same grid with the glyph's own
+        // dots - and their immediate neighbours, so the spot's spread does not
+        // close the hole - left dark.  It fills the glyph's box rather than the
+        // whole cell: the grid is the box a glyph can ink, which is all the
+        // raster mode has to invert.
+        let lit = |gx: i32, gy: i32| -> bool {
+            gx >= 0
+                && gy >= 0
+                && (gx as u32) < gw
+                && (gy as u32) < gh
+                && bits[gy as usize * gw as usize + gx as usize]
+        };
+        for gy in 0..gh as i32 {
+            for gx in 0..gw as i32 {
+                let on = if reverse {
+                    !(lit(gx, gy)
+                        || lit(gx - 1, gy)
+                        || lit(gx + 1, gy)
+                        || lit(gx, gy - 1)
+                        || lit(gx, gy + 1))
+                } else {
+                    lit(gx, gy)
+                };
+                if on {
                     let cx = x + (gx as f32 + 0.5) * dx;
                     let cy = top - (gy as f32 + 0.5) * dy;
                     self.dot(cx.round() as i32, cy.round() as i32, energy, st);
@@ -1802,6 +1896,21 @@ fn to8(v: f32) -> u32 {
     (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32
 }
 
+/// Squared distance from a point to a line segment.  The stencil uses it the
+/// way `cover` does, to ask whether a dot is within the glyph's own strokes;
+/// squared so the comparison needs no square root in the per-dot loop.
+fn dist2(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let (dx, dy) = (bx - ax, by - ay);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 {
+        (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (qx, qy) = (ax + t * dx, ay + t * dy);
+    (px - qx) * (px - qx) + (py - qy) * (py - qy)
+}
+
 impl Sink for Tube {
     fn erase(&mut self) {
         Tube::erase(self);
@@ -1820,7 +1929,7 @@ impl Sink for Tube {
     }
 
     fn character(&mut self, ch: u8, x: i32, y: i32, cell_w: i32, cell_h: i32, st: Style) {
-        Tube::character(self, ch, x as f32, y as f32, cell_w, cell_h, st, 1.0);
+        Tube::character(self, ch, x as f32, y as f32, cell_w, cell_h, st, 1.0, false);
     }
 }
 
@@ -2004,6 +2113,55 @@ mod tests {
         assert_eq!(lit(&mut off), 0, "a storage tube keeps nothing");
     }
 
+    /// Reverse video is drawn as a stencil, because a storage tube cannot
+    /// un-write charge: the cell is filled with the pen and the glyph is the
+    /// hole it leaves.  A horizontal rule is the cleanest cell to ask about -
+    /// its own line is the hole, the rows above and below it are the bar - so
+    /// this is what says the hole is really left dark, the rest really inked,
+    /// and a reversed cell is not just a normal one.
+    #[test]
+    fn a_reverse_cell_is_drawn_as_a_stencil() {
+        let rule = 0x80 + (b'q' - 0x5f);
+        let cell = |reverse: bool| {
+            let mut t = Tube::new(128, 128);
+            // one dot of beam, so the hole is a stroke and a half and rows well
+            // clear of it are unambiguously inside the bar
+            t.sigma = 1.0;
+            t.character(
+                rule,
+                10.0,
+                40.0,
+                64,
+                48,
+                Style {
+                    line: LineStyle::Solid,
+                    defocus: false,
+                    write: Write::Settle,
+                },
+                1.0,
+                reverse,
+            );
+            t
+        };
+        let at = |t: &Tube, x: i32, y: i32| t.stored[(y * t.w + x) as usize];
+
+        let normal = cell(false);
+        // the glyph inks its own line and nothing above or below it
+        assert!(at(&normal, 40, 64) > 0.0, "the rule is drawn where it is");
+        assert_eq!(at(&normal, 40, 44), 0.0, "and nowhere else");
+
+        let reverse = cell(true);
+        // the rule's own line is the hole the bar is cut around...
+        assert_eq!(at(&reverse, 40, 64), 0.0, "the glyph's own area is un-inked");
+        // ...and the rest of the cell is filled, where the normal cell is bare
+        assert!(at(&reverse, 40, 44) > 0.0, "the bar fills the cell");
+        assert!(at(&reverse, 40, 84) > 0.0, "on both sides of the glyph");
+        assert!(
+            at(&reverse, 40, 44) > at(&normal, 40, 44),
+            "a reverse cell is not a normal one"
+        );
+    }
+
     /// The dot matrix draws the same glyph in the same place: the ink box is the
     /// cell's own box either way, so switching the face does not move the text.
     #[test]
@@ -2030,6 +2188,7 @@ mod tests {
                     write: Write::Settle,
                 },
                 1.0,
+                false,
             );
             t.decay(600.0);
             let (w, h) = (t.w as usize, t.h as usize);
