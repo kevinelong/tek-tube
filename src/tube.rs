@@ -312,6 +312,13 @@ pub struct Tube {
     /// "keep the largest value" rule still holds across decay steps.
     fresh_scale: f32,
     under_scale: f32,
+    /// Whether a transient population actually holds light - a *population*, not
+    /// the decay scale.  The scale is reset to 1.0 when the array underflows, so
+    /// judging liveness by it left a quiet tube reporting itself alive for ever:
+    /// a fullscreen terminal then recomposed 2560x1440 at 8 fps with nothing on
+    /// the screen at all, 28 % of a core, measured over 7.5 hours.
+    fresh_alive: bool,
+    under_alive: bool,
 
     /// Target dots per 4010 dot (1 on the 4010, 4 on the 4014).  Also the unit
     /// the dash patterns are measured in.
@@ -397,6 +404,8 @@ impl Tube {
             beam_dots: 0.0,
             fresh_scale: 1.0,
             under_scale: 1.0,
+            fresh_alive: false,
+            under_alive: false,
             dot_rows: 0,
             raster: std::collections::HashMap::new(),
             render_offset: 0,
@@ -427,6 +436,8 @@ impl Tube {
         self.under.iter_mut().for_each(|v| *v = 0.0);
         self.fresh_scale = 1.0;
         self.under_scale = 1.0;
+        self.fresh_alive = false;
+        self.under_alive = false;
         // The ghost is light that has already left the phosphor, and erasing the
         // charge does not switch it off - it fades on its own.  That is why a
         // raster terminal's page still glows for a moment after a clear.
@@ -501,10 +512,12 @@ impl Tube {
         if self.fresh_scale < MIN_SCALE {
             self.fresh.iter_mut().for_each(|v| *v = 0.0);
             self.fresh_scale = 1.0;
+            self.fresh_alive = false;
         }
         if self.under_scale < MIN_SCALE {
             self.under.iter_mut().for_each(|v| *v = 0.0);
             self.under_scale = 1.0;
+            self.under_alive = false;
         }
         if self.ghost_scale > 0.0 {
             self.ghost_scale *= (-dt / self.ghost_tau.max(1e-3)).exp();
@@ -531,12 +544,14 @@ impl Tube {
                 if self.under[i] * s < energy {
                     self.under[i] = energy / s;
                 }
+                self.under_alive = true;
             }
             Write::Flash => {
                 let s = self.fresh_scale;
                 if self.fresh[i] * s < energy {
                     self.fresh[i] = energy / s;
                 }
+                self.fresh_alive = true;
             }
             Write::Settle => {
                 if self.stored[i] < energy {
@@ -551,6 +566,7 @@ impl Tube {
                 if self.fresh[i] * s < energy {
                     self.fresh[i] = energy / s;
                 }
+                self.fresh_alive = true;
             }
         }
     }
@@ -1207,7 +1223,7 @@ impl Tube {
     /// no new input has arrived, the target is not changing, and a window can
     /// skip recomposing the frame entirely.
     pub fn transients_alive(&self) -> bool {
-        self.fresh_scale > 1e-3 || self.under_scale > 1e-3
+        self.fresh_alive || self.under_alive
     }
 
     /// Mean emitted light of the whole target, plus the fraction of the target
@@ -1872,6 +1888,54 @@ mod tests {
             dn as f32 > sn as f32 * 0.4 && dn < sn * 4,
             "the two paths should be comparable in weight: {dn} dots against {sn} stroke pixels"
         );
+    }
+
+    /// The tube is "alive" only while a transient population actually holds
+    /// light.  It used to be judged by the decay *scale*, which is reset to 1.0
+    /// once an array underflows - so after any quiet period the tube reported
+    /// itself alive for ever, and a fullscreen terminal went on recomposing
+    /// 2560x1440 at 8 fps with nothing on the screen: 220,350 frames, 28 % of the
+    /// wall clock, over a 7.5 hour session that had been idle since its second
+    /// command.
+    #[test]
+    fn a_quiet_tube_stops_being_alive() {
+        let mut t = Tube::new(64, 64);
+        assert!(!t.transients_alive(), "a new tube has nothing glowing");
+        t.dot(
+            32,
+            32,
+            1.0,
+            Style {
+                line: LineStyle::Solid,
+                defocus: false,
+                write: Write::Flash,
+            },
+        );
+        assert!(t.transients_alive(), "a flash is light on the face");
+        // long enough for the array to underflow and be dropped
+        let mut waited = 0.0f32;
+        while waited < t.fresh_tau * 60.0 {
+            t.decay(0.5);
+            waited += 0.5;
+        }
+        assert!(
+            !t.transients_alive(),
+            "once it has faded there is nothing left to draw"
+        );
+        // and an erase takes the light with it at once
+        t.dot(
+            32,
+            32,
+            1.0,
+            Style {
+                line: LineStyle::Solid,
+                defocus: false,
+                write: Write::Through,
+            },
+        );
+        assert!(t.transients_alive(), "write-through light counts too");
+        t.erase();
+        assert!(!t.transients_alive(), "an erase leaves nothing glowing");
     }
 
     #[test]
