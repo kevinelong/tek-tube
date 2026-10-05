@@ -494,6 +494,17 @@ impl Tube {
         }
     }
 
+    /// The scale at which a transient population can no longer move the display
+    /// by one step, and so is not worth composing for.
+    ///
+    /// The transfer is `light^(1/2.2)` onto 8 bits, so one display step is a
+    /// light of about `(1/255)^2.2 * RAMP_MAX`, and the brightest a stroke
+    /// deposits is 1.0: at a scale of 2e-6 the whole population displays 0.0026,
+    /// below the first step there is.  The test used to be the array's underflow
+    /// (1e-20, forty-six time constants), which cost a fullscreen tube three and
+    /// a half times the compositing it could possibly show after every change.
+    pub const ALIVE_SCALE: f32 = 2e-6;
+
     /// Exponential decay of the transient populations.  Costs one multiply:
     /// the populations are stored at `fresh_scale` / `under_scale`, which is
     /// what actually decays.  The arrays are only touched when the scale has
@@ -505,6 +516,16 @@ impl Tube {
         const MIN_SCALE: f32 = 1e-20;
         self.fresh_scale *= (-dt / self.fresh_tau.max(1e-3)).exp();
         self.under_scale *= (-dt / self.under_tau.max(1e-3)).exp();
+        // Below `ALIVE_SCALE` a population cannot move a display step, so it is
+        // not worth composing for even though its values are still meaningful: a
+        // later deposit divides by the current scale, so what is left simply
+        // stays dark.  This is what bounds the compositing after a change.
+        if self.fresh_alive && self.fresh_scale <= Self::ALIVE_SCALE {
+            self.fresh_alive = false;
+        }
+        if self.under_alive && self.under_scale <= Self::ALIVE_SCALE {
+            self.under_alive = false;
+        }
         // once the scale has underflowed the values in the array no longer
         // describe anything (they were written at a much larger scale), so drop
         // them and start again.  This is the only path that touches the array
@@ -1921,6 +1942,34 @@ mod tests {
         assert!(
             !t.transients_alive(),
             "once it has faded there is nothing left to draw"
+        );
+
+        // and it goes quiet as soon as the light could no longer move a display
+        // step, rather than at the array's underflow, which is four times later
+        assert!(
+            t.phosphor.encode(Tube::ALIVE_SCALE) < 1.0 / 255.0,
+            "the threshold must be below one display step: {}",
+            t.phosphor.encode(Tube::ALIVE_SCALE)
+        );
+        let mut t2 = Tube::new(64, 64);
+        t2.dot(
+            32,
+            32,
+            1.0,
+            Style {
+                line: LineStyle::Solid,
+                defocus: false,
+                write: Write::Flash,
+            },
+        );
+        let mut waited = 0.0f32;
+        while t2.transients_alive() && waited < t2.fresh_tau * 46.0 {
+            t2.decay(0.05);
+            waited += 0.05;
+        }
+        assert!(
+            waited < t2.fresh_tau * 20.0,
+            "a decayed population should stop counting long before the underflow: {waited}"
         );
         // and an erase takes the light with it at once
         t.dot(
