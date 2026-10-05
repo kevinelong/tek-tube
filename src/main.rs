@@ -68,6 +68,10 @@ struct Options {
     /// Terminal mode: draw the screen with the beam at this many target dots
     /// per second, so the writing can be watched stroke by stroke.
     write_rate: Option<f32>,
+    /// Terminal mode: seconds the page a scroll replaced keeps glowing where it
+    /// was.  Zero - the default - has no ghost at all, which is what a storage
+    /// tube does: its charge does not fade.
+    ghost: Option<f32>,
     /// Replay a captured terminal byte stream instead of a plot file.  A
     /// diagnostic for the terminal renderer, which is otherwise only reachable
     /// by typing into a window.
@@ -114,6 +118,7 @@ impl Default for Options {
             trail: None,
             vt_replay: None,
             write_rate: None,
+            ghost: None,
             cell: None,
             quiet: false,
         }
@@ -204,6 +209,11 @@ Usage: tek-tube [options] file.plt [more.plt ...]
                             i.e. the length of the smear (default 0.3, a quick
                             cool from the flash to the stored green; 0 gives a
                             plain storage tube with no trail at all)
+  --ghost F                 terminal mode: seconds the page a scroll replaced
+                            keeps glowing underneath the new one.  That is what a
+                            raster terminal's phosphor does and the source of the
+                            ghosting real terminals show; a storage tube's charge
+                            does not fade, so the default is 0, no ghost
   --shell CMD               run a shell under a pseudoconsole and render the
                             session on the tube instead of playing plot files,
                             e.g. --shell powershell.exe.  The page is the
@@ -680,6 +690,11 @@ fn configure_terminal_tube(tube: &mut Tube, dev: Device, opts: &Options, cell: f
     // settled in well under a second - and it leaves just enough smear that the
     // writing looks like a beam rather than a paste.
     tube.fresh_tau = opts.trail.unwrap_or(0.3);
+    // A raster terminal's phosphor keeps the page it has just replaced lit for a
+    // moment, so scrolling leaves the previous screenful readable underneath the
+    // new one.  A storage tube's charge is permanent and does not fade, so this
+    // is off unless asked for.
+    tube.ghost_tau = opts.ghost.unwrap_or(0.0);
 }
 
 /// Terminal mode: run a shell under a pseudoconsole and render it on the tube.
@@ -1276,6 +1291,7 @@ where
             "--trail" => o.trail = Some(value("--trail")?.parse()?),
             "--vt-replay" => o.vt_replay = Some(PathBuf::from(value("--vt-replay")?)),
             "--write-rate" => o.write_rate = Some(value("--write-rate")?.parse()?),
+            "--ghost" => o.ghost = Some(value("--ghost")?.parse()?),
             "--cell" => o.cell = Some(value("--cell")?.parse()?),
             "--no-autoclear" => o.autoclear = false,
             "--no-enhanced" => o.enhanced = false,

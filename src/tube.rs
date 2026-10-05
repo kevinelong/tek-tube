@@ -307,6 +307,15 @@ pub struct Tube {
     /// slide a scroll animates.  Zero is where the image really is.
     pub render_offset: i32,
 
+    /// The image the page replaced, still glowing, and how much of it is left.
+    /// A raster terminal leaves the previous screenful lit underneath the new
+    /// one; a storage tube does not, so this is empty unless `ghost_tau` is set.
+    ghost: Vec<f32>,
+    ghost_scale: f32,
+    /// Seconds a captured page keeps glowing.  Zero turns the ghost off, which
+    /// is what the tube does on its own: charge does not fade.
+    pub ghost_tau: f32,
+
     /// Scratch for composing a frame (kept to avoid per frame allocation).
     light_buf: Vec<f32>,
     fresh_buf: Vec<f32>,
@@ -346,6 +355,9 @@ impl Tube {
             fresh_scale: 1.0,
             under_scale: 1.0,
             render_offset: 0,
+            ghost: Vec::new(),
+            ghost_scale: 0.0,
+            ghost_tau: 0.0,
             light_buf: Vec::new(),
             fresh_buf: Vec::new(),
             bloom_light: Vec::new(),
@@ -369,6 +381,25 @@ impl Tube {
         self.under.iter_mut().for_each(|v| *v = 0.0);
         self.fresh_scale = 1.0;
         self.under_scale = 1.0;
+        self.ghost.clear();
+        self.ghost_scale = 0.0;
+    }
+
+    /// Keep the image that is on the tube now as a fading ghost.
+    ///
+    /// A raster terminal writes the new screen over the old one and the old
+    /// one's light is still on the face, which is what the ghosting in a real
+    /// terminal looks like: the previous screenful, one or more lines out of
+    /// place, still legible underneath.  A storage tube has no such thing - its
+    /// stored charge is permanent and does not fade - so this does nothing
+    /// unless `ghost_tau` has been set.
+    pub fn capture_ghost(&mut self) {
+        if self.ghost_tau <= 0.0 {
+            return;
+        }
+        self.ghost.clear();
+        self.ghost.extend_from_slice(&self.stored);
+        self.ghost_scale = 1.0;
     }
 
     /// Exponential decay of the transient populations.  Costs one multiply:
@@ -393,6 +424,13 @@ impl Tube {
         if self.under_scale < MIN_SCALE {
             self.under.iter_mut().for_each(|v| *v = 0.0);
             self.under_scale = 1.0;
+        }
+        if self.ghost_scale > 0.0 {
+            self.ghost_scale *= (-dt / self.ghost_tau.max(1e-3)).exp();
+            if self.ghost_scale < MIN_SCALE {
+                self.ghost.clear();
+                self.ghost_scale = 0.0;
+            }
         }
     }
 
@@ -444,29 +482,6 @@ impl Tube {
     /// is exactly the problem a terminal has to solve and a plot file does not.
     pub fn clear_stored(&mut self) {
         self.stored.iter_mut().for_each(|v| *v = 0.0);
-    }
-
-    /// Move the committed image up the face by `dots` target rows, blanking what
-    /// the move exposes at the bottom of the screen.
-    ///
-    /// What a scroll does.  The charge on real hardware cannot move - the host
-    /// rewrites the page instead - but a bitmap can, and moving it is what lets a
-    /// scroll carry the image (and the beam's trail with it) rather than being
-    /// rewritten line by line at the pen's rate.
-    pub fn shift_rows(&mut self, dots: i32) {
-        let dots = dots.clamp(0, self.h) as usize;
-        if dots == 0 {
-            return;
-        }
-        let stride = self.w as usize;
-        let delta = dots * stride;
-        let moved = self.stored.len() - delta;
-        for buf in [&mut self.stored, &mut self.fresh, &mut self.under] {
-            // up the face is toward larger y, and the copy has to run from the
-            // top down or it would overwrite rows it has not read yet
-            buf.copy_within(0..moved, delta);
-            buf[..delta].iter_mut().for_each(|v| *v = 0.0);
-        }
     }
 
     /// Dash pattern in beam units: one entry means "always on", otherwise
@@ -815,10 +830,16 @@ impl Tube {
                 w: tw,
                 h: th,
                 render_offset,
+                ghost,
+                ghost_scale,
                 ..
             } = self;
             let (stored, fresh, under) = (&*stored, &*fresh, &*under);
             let (tw, th) = (*tw as usize, *th as usize);
+            // the ghost of the page before this one, if there is one: it fades
+            // where it was, like the light a raster terminal left behind
+            let ghost: &[f32] = if ghost.len() == tw * th { ghost } else { &[] };
+            let ghost_scale = *ghost_scale;
             // a scroll slides: the image is already where it belongs, and the
             // offset shows it displaced down the face until the slide finishes
             let off = *render_offset as i64;
@@ -847,6 +868,9 @@ impl Tube {
                                 }
                                 let i = row + x;
                                 light += stored[i] * gs + fresh[i] * gf + under[i] * gu;
+                                if !ghost.is_empty() {
+                                    light += ghost[i] * gs * ghost_scale;
+                                }
                                 fl += fresh[i] * gf;
                                 count += 1.0;
                             }

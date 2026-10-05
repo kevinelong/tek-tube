@@ -529,6 +529,20 @@ as the rest or it comes out 40 % oversized, as that probe did.  It is not
 shipped; the probe was removed rather than left as a half-font that draws
 nothing for most characters.
 
+**Ghosting, if you want it.**  A raster terminal writes the new screen *over* the
+old one, and the old one's light is still on the face: replace a screenful at a
+time and the previous screenful stays readable underneath the new one, in the
+same rows.  Measured from a Wyse-60 running `ls -l /etc` over a serial link: the
+screen is completely static between writes (consecutive 33 ms frames correlate at
+zero displacement), and what looks like motion is the previous page's phosphor
+still lit through the new one, fading in a fraction of a second.  A storage tube
+has no such thing - its charge is permanent and a commit *replaces* the image
+rather than merging into it - so this one does not ghost on its own.  `--ghost F`
+captures the page a scroll replaces as a fading layer for F seconds
+(`Tube::capture_ghost`, decayed like the transients and summed into the light, so
+it haloes like everything else).  Default 0: no ghost, which is what the hardware
+being emulated does.
+
 **The image works the way a storage tube forces it to.**  A storage tube cannot
 erase one character, so content that is still moving is written into the
 transient population only: it flashes hot and decays, and because each frame

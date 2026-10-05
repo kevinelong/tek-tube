@@ -793,8 +793,11 @@ impl Terminal {
     pub fn commit(&mut self, tube: &mut Tube) {
         let mut traced = self.write_rate.is_some() && !self.page_replaced;
         if self.pending_scroll > 0 {
-            let ch = (tube.h / self.rows.max(1) as i32).max(1);
-            tube.shift_rows(self.pending_scroll as i32 * ch);
+            // The page moved, and what was on the tube stays glowing where it
+            // was for as long as `--ghost` asks: the previous screenful still
+            // legible underneath the new one, which is what a raster terminal
+            // looks like.  The new page is stamped in place by the commit below.
+            tube.capture_ghost();
             self.pen.sync(&self.screen);
             self.pending_scroll = 0;
             traced = true;
@@ -1365,10 +1368,8 @@ mod tests {
         parser.feed(b"\r\nseven", &mut screen);
         assert_eq!(screen.take_page_change(), PageChange::Scroll(1));
 
-        // what the commit does with that: move the image, sync the record so
-        // nothing is retraced, and settle the moved page in one go
-        let ch = (tube.h / 6).max(1);
-        tube.shift_rows(ch);
+        // what the commit does with that: sync the record so nothing is
+        // retraced, and settle the moved page in one go
         pen.sync(&screen);
         assert!(
             !pen.busy(&screen),
@@ -1388,6 +1389,63 @@ mod tests {
             );
         }
         assert!(after[5], "the line that scrolled in must be there: {after:?}");
+    }
+
+    /// Lit pixels in the rendered frame, the same band test the tube's own tests
+    /// use for "is there ink here".
+    fn lit_pixels(tube: &mut Tube) -> usize {
+        let mut buf = Vec::new();
+        tube.render_into(&mut buf, 1, 1);
+        buf.iter().filter(|p| ((**p >> 8) & 0xff) > 140).count()
+    }
+
+    /// With `--ghost`, the page a scroll replaced keeps glowing where it was:
+    /// the previous screenful still legible underneath the new one, which is
+    /// what a raster terminal's phosphor does and what our storage tube does
+    /// not - its charge is permanent, so the ghost is off unless asked for.
+    #[test]
+    fn a_ghost_lingers_where_the_old_page_was_and_then_fades() {
+        let mut screen = vt::Screen::new(40, 6);
+        let mut parser = vt::Parser::new();
+        parser.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix", &mut screen);
+
+        let mut tube = Tube::new(1024, 780);
+        tube.ghost_tau = 1.0;
+        // the page that is on the tube when the scroll happens
+        stroke_screen(&screen, 40, 6, &mut tube, Write::Settle, false);
+        tube.capture_ghost();
+
+        // the page moves: the next six lines are stamped where the old ones were
+        parser.feed(b"\r\nseven\r\neight\r\nnine\r\nten\r\neleven\r\ntwelve", &mut screen);
+        tube.clear_stored();
+        stroke_screen(&screen, 40, 6, &mut tube, Write::Settle, false);
+
+        let with_ghost = lit_pixels(&mut tube);
+        tube.decay(20.0);
+        let page_only = lit_pixels(&mut tube);
+        assert!(
+            with_ghost > page_only,
+            "the ghost must add light: {with_ghost} against {page_only}"
+        );
+
+        // and what is left when it has faded is exactly the new page
+        let mut plain = Tube::new(1024, 780);
+        stroke_screen(&screen, 40, 6, &mut plain, Write::Settle, false);
+        assert_eq!(
+            page_only,
+            lit_pixels(&mut plain),
+            "the ghost must fade to nothing, leaving the page"
+        );
+
+        // with the ghost off there is nothing to capture in the first place
+        let mut off = Tube::new(1024, 780);
+        stroke_screen(&screen, 40, 6, &mut off, Write::Settle, false);
+        off.capture_ghost();
+        assert_eq!(
+            lit_pixels(&mut off),
+            page_only,
+            "a storage tube's charge does not fade, so nothing is captured"
+        );
     }
 
     /// A page replacement takes the previous page's *glow* with it, not just its
