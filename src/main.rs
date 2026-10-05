@@ -87,6 +87,9 @@ struct Options {
     /// character ROM is built.  Zero strokes them, which is what a storage
     /// tube's beam does.
     dots: Option<usize>,
+    /// The phone camera the source footage was shot on: blur and grain only, no
+    /// contrast curve.  What a filmed terminal needs.
+    lens: Option<f32>,
     /// Replay a captured terminal byte stream instead of a plot file.  A
     /// diagnostic for the terminal renderer, which is otherwise only reachable
     /// by typing into a window.
@@ -138,6 +141,7 @@ impl Default for Options {
             slide: None,
             scan: None,
             dots: None,
+            lens: None,
             cell: None,
             quiet: false,
         }
@@ -258,6 +262,12 @@ Usage: tek-tube [options] file.plt [more.plt ...]
                             Equivalent to --write-rate 0 --slide 0 --ghost 0.1
                             --scan 0.5 --dots 15 --ambient 0 --trail 0.2
                             --baud 19200; a later flag overrides any of them
+  --lens F                  the phone camera the source footage was shot on: F
+                            is the lens blur and grain, 0 (the default) is the
+                            sharp device.  It applies no contrast curve, unlike
+                            --camera, so it is what a *filmed* terminal needs -
+                            the tube as a camera saw it, without a lens model
+                            calibrated through a different scene
   --shell CMD               run a shell under a pseudoconsole and render the
                             session on the tube instead of playing plot files,
                             e.g. --shell powershell.exe.  The page is the
@@ -541,6 +551,14 @@ fn configure_tube(tube: &mut Tube, dev: Device, opts: &Options) {
         tube.dot_rows = v;
     }
     tube.phosphor.camera = opts.camera;
+    if opts.camera {
+        // the capture model is the camera *and* its lens
+        tube.phosphor.cam_blur = tube::CAM_BLUR;
+        tube.phosphor.cam_noise = tube::CAM_NOISE;
+    }
+    if let Some(v) = opts.lens {
+        tube.phosphor.cam_blur = v.max(0.0);
+    }
     tube.font = font::face(opts.font);
 }
 
@@ -1552,6 +1570,7 @@ where
             "--slide" => o.slide = Some(value("--slide")?.parse()?),
             "--scan" => o.scan = Some(value("--scan")?.parse()?),
             "--dots" => o.dots = Some(value("--dots")?.parse()?),
+            "--lens" => o.lens = Some(value("--lens")?.parse()?),
             // The raster-terminal look, in one flag.  Every value here is one
             // the measurements settled on (see the README), and any of them can
             // be overridden by a later flag on the same command line.

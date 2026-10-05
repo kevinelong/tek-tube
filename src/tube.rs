@@ -141,7 +141,9 @@ pub struct Phosphor {
     /// where the leak-free curve gives 0.29.
     pub cam_leak_b: f32,
     /// The phone's lens/compression blur: the video's strokes measure 3.7 dots
-    /// across where the sharp museum photo measures 2.2.
+    /// across where the sharp museum photo measures 2.2.  Zero by default: this
+    /// is the *camera*, not the tube, so it is applied only when `--camera` or
+    /// `--lens` asks (see `CAM_BLUR`).
     pub cam_blur: f32,
     /// Sensor/compression noise, in 0..1 units per pixel.
     pub cam_noise: f32,
@@ -206,8 +208,8 @@ impl Default for Phosphor {
             cam_knee: 2.20,
             cam_leak: 0.24,
             cam_leak_b: 0.28,
-            cam_blur: 0.45,
-            cam_noise: 0.006,
+            cam_blur: 0.0,
+            cam_noise: 0.0,
         }
     }
 }
@@ -286,6 +288,13 @@ struct FieldKey {
     gradient: f32,
     ambient: f32,
 }
+
+/// The lens blur and sensor noise a phone camera put on the source footage,
+/// measured from it: strokes 3.7 dots across where a sharp photo of the same
+/// hardware measures 2.2.  `--camera` applies these with the capture curve;
+/// `--lens` applies only these, which is what a filmed terminal needs.
+pub const CAM_BLUR: f32 = 0.45;
+pub const CAM_NOISE: f32 = 0.006;
 
 /// How much of the cell a glyph fills vertically, and how far above the cell's
 /// bottom its baseline sits.  Both the stroked path and the dot matrix path use
@@ -1228,8 +1237,10 @@ impl Tube {
             }
         });
 
-        // a phone camera softens and grains the picture
-        if self.phosphor.camera && (self.phosphor.cam_blur > 0.0 || self.phosphor.cam_noise > 0.0) {
+        // a phone camera softens and grains the picture.  The capture *curve* is
+        // the `camera` flag's business, in the colour pass; this is the lens, and
+        // it runs whenever a blur or grain is asked for
+        if self.phosphor.cam_blur > 0.0 || self.phosphor.cam_noise > 0.0 {
             camera_finish(
                 out,
                 ow * zoom,
@@ -1985,6 +1996,48 @@ mod tests {
         assert!(t.transients_alive(), "write-through light counts too");
         t.erase();
         assert!(!t.transients_alive(), "an erase leaves nothing glowing");
+    }
+
+    /// `--lens` blurs without the capture curve: a blur keeps the mean light,
+    /// the curve takes most of it away.
+    #[test]
+    fn the_lens_blurs_without_the_capture_curve() {
+        let mean = |blur: f32, camera: bool| {
+            let mut t = Tube::new(256, 128);
+            t.phosphor.cam_blur = blur;
+            t.phosphor.cam_noise = 0.0;
+            t.phosphor.camera = camera;
+            t.phosphor.ambient = 0.0;
+            for y in (30..100).step_by(10) {
+                t.line(
+                    20,
+                    y,
+                    230,
+                    y,
+                    Style {
+                        line: LineStyle::Solid,
+                        defocus: false,
+                        write: Write::Settle,
+                    },
+                    1.0,
+                );
+            }
+            t.decay(600.0);
+            let mut buf = Vec::new();
+            t.render_into(&mut buf, 1, 1);
+            buf.iter().map(|p| ((p >> 8) & 0xff) as u64).sum::<u64>() as f64 / (256.0 * 128.0)
+        };
+        let sharp = mean(0.0, false);
+        let blurred = mean(0.6, false);
+        let curved = mean(0.6, true);
+        assert!(
+            (blurred - sharp).abs() < sharp * 0.15,
+            "a lens keeps the mean light: {blurred:.2} against {sharp:.2}"
+        );
+        assert!(
+            curved < blurred * 0.7,
+            "the capture curve takes light away: {curved:.2} against {blurred:.2}"
+        );
     }
 
     #[test]
