@@ -108,6 +108,13 @@ pub struct Phosphor {
     /// Sparse brighter specks in the field (measured: ~2 % of background
     /// pixels, about 26 % above the local field, one to three dots across).
     pub speck: f32,
+    /// The raster scan's own banding: a raster terminal lights the screen a line
+    /// at a time, so a lit area is striped rather than flat, which is most of
+    /// what makes a photograph of one read as a CRT.  Zero - the default - has
+    /// no structure at all, which is what a vector display does.
+    pub scan_depth: f32,
+    /// Scan lines a display row: one every three rows unless told otherwise.
+    pub scan_freq: f32,
     /// `light^(1/DISPLAY_GAMMA)` tabulated over `0..=RAMP_MAX`, linearly
     /// interpolated.  The table *is* the transfer: there is no live exponent to
     /// get out of step with it.
@@ -190,6 +197,8 @@ impl Default for Phosphor {
             bloom_farther_radius: 420.0,
             gradient: 0.10,
             speck: 0.20,
+            scan_depth: 0.0,
+            scan_freq: 1.0 / 3.0,
             ramp,
             camera: false,
             cam_pivot: 0.69,
@@ -204,6 +213,18 @@ impl Default for Phosphor {
 }
 
 impl Phosphor {
+    /// How much light a display row carries from the scan itself: 1.0 with no
+    /// structure, dipping by `scan_depth` between lines.  A cosine, so the
+    /// bands have no hard edges to alias against the display's own grid.
+    pub fn scan_at(&self, row: usize) -> f32 {
+        if self.scan_depth <= 0.0 {
+            return 1.0;
+        }
+        let phase = (row as f32 * self.scan_freq) % 1.0;
+        let band = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
+        1.0 - self.scan_depth * band
+    }
+
     /// Display level for a linear light value: the phosphor's own
     /// non-linearity and the recording chain, as one exponent.  Table driven,
     /// because this runs three times per output pixel.
@@ -975,6 +996,8 @@ impl Tube {
         );
         let ph: &Phosphor = &*ph;
         par_rows(&mut out[..], stride * zoom, |oy, row| {
+            // the scan's own banding, measured in unzoomed display rows
+            let scan = ph.scan_at(oy / zoom);
             for ox in 0..ow {
                 let i = oy * ow + ox;
                 let amb = field[i];
@@ -986,6 +1009,10 @@ impl Tube {
                     light += bloom_light[i];
                     fl += bloom_fresh[i];
                 }
+                // light a raster terminal never emits flatly: 1.0 when there is
+                // no scan structure at all
+                light *= scan;
+                fl *= scan;
                 let (r, g, b) = ph.rgb_from_light(light, fl, amb);
                 let cam = ph;
                 let (r, g, b) = if cam.camera {
@@ -1549,6 +1576,54 @@ mod tests {
             "the last of the flash must fade away: {:?} -> {:?}",
             settled,
             final_colour
+        );
+    }
+
+    #[test]
+    fn the_scan_structure_bands_the_light() {
+        // a flat, lit face with the flood gun's own texture switched off, so the
+        // only thing that can make two rows differ is the scan
+        let mut t = Tube::new(64, 64);
+        for v in t.stored.iter_mut() {
+            *v = 0.5;
+        }
+        let ph = &mut t.phosphor;
+        ph.ambient = 0.0;
+        ph.mottle = 0.0;
+        ph.grain = 0.0;
+        ph.vignette = 0.0;
+        ph.gradient = 0.0;
+        ph.speck = 0.0;
+        let rows = |t: &mut Tube| {
+            let (w, h) = (t.w as usize, t.h as usize);
+            let mut buf = Vec::new();
+            t.render_into(&mut buf, 1, 1);
+            (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| ((buf[y * w + x] >> 8) & 0xff) as u32)
+                        .sum::<u32>()
+                })
+                .collect::<Vec<_>>()
+        };
+        // the middle rows, so the blur's edges do not enter into it
+        let flat = rows(&mut t)[16..48].to_vec();
+        for w in flat.windows(2) {
+            assert!(
+                w[0].abs_diff(w[1]) <= 1,
+                "a face with no scan structure is flat: {w:?}"
+            );
+        }
+        t.phosphor.scan_depth = 0.6;
+        let striped = rows(&mut t)[16..48].to_vec();
+        let worst = striped
+            .windows(2)
+            .map(|w| w[0].abs_diff(w[1]))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            worst > 20,
+            "the scan must band the light, worst row step was {worst}"
         );
     }
 

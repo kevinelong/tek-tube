@@ -816,7 +816,11 @@ impl Terminal {
             tube.capture_ghost();
             self.pen.sync(&self.screen);
             self.pending_scroll = 0;
-            traced = true;
+            // Only the pen's path can settle what it has drawn.  With no pen the
+            // record is not being kept, so settling it would clear the stored
+            // image and stamp nothing - the page disappeared for as long as the
+            // next commit took.  A penless scroll is a whole-page stroke.
+            traced = self.write_rate.is_some();
         } else if self.page_replaced {
             // A clear leaves its light as well: blanking a cell does not switch
             // off the phosphor that was in it, which is why a raster terminal's

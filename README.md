@@ -550,6 +550,15 @@ changes land in one step, and the page before each of them stays lit while it
 fades.  An erase leaves the ghost too, because blanking a cell does not switch
 off the phosphor that was in it.
 
+`--scan D` puts the raster scan's own structure back: a raster terminal lights
+the screen a line at a time, so a lit area is striped rather than flat, and that
+stripe is most of what makes a photograph of one read as a CRT.  Default 0, a
+flat face, which is what a vector display emits.  Two knobs belong with it for
+the same reason: `--ambient 0` takes the flood gun's glow away, because a raster
+display's background is black rather than a lit field, and `--trail` should be
+short (0.2 s), because what a raster terminal leaves behind is the previous
+*page* - which is `--ghost` - not a glow around everything it has just written.
+
 **The image works the way a storage tube forces it to.**  A storage tube cannot
 erase one character, so content that is still moving is written into the
 transient population only: it flashes hot and decays, and because each frame

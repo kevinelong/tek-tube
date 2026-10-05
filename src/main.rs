@@ -75,6 +75,10 @@ struct Options {
     /// Terminal mode: rows a second the display slides a scroll at.  Zero makes
     /// a scroll jump, which is what a raster terminal does.
     slide: Option<f32>,
+    /// The raster scan's own light structure: 0 is a flat face, and this is how
+    /// deep the gaps between scan lines go.  Off by default, because a vector
+    /// display has no scan lines at all.
+    scan: Option<f32>,
     /// Replay a captured terminal byte stream instead of a plot file.  A
     /// diagnostic for the terminal renderer, which is otherwise only reachable
     /// by typing into a window.
@@ -123,6 +127,7 @@ impl Default for Options {
             write_rate: None,
             ghost: None,
             slide: None,
+            scan: None,
             cell: None,
             quiet: false,
         }
@@ -222,6 +227,11 @@ Usage: tek-tube [options] file.plt [more.plt ...]
                             scroll at (default 30).  0 makes a scroll land in one
                             step, the way a raster terminal's does when the
                             movement is carried by the residual image instead
+  --scan D                  the raster scan's own light structure: D is how deep
+                            the gaps between scan lines go, 0 (the default) is a
+                            flat face.  A vector display emits no scan lines; a
+                            raster one is striped, and that stripe is most of
+                            what makes a photograph of one read as a CRT
   --shell CMD               run a shell under a pseudoconsole and render the
                             session on the tube instead of playing plot files,
                             e.g. --shell powershell.exe.  The page is the
@@ -497,6 +507,9 @@ fn configure_tube(tube: &mut Tube, dev: Device, opts: &Options) {
     }
     if let Some(v) = opts.bloom_wide {
         tube.phosphor.bloom_wide = v;
+    }
+    if let Some(v) = opts.scan {
+        tube.phosphor.scan_depth = v.clamp(0.0, 0.95);
     }
     tube.phosphor.camera = opts.camera;
     tube.font = font::face(opts.font);
@@ -1494,6 +1507,7 @@ where
             "--write-rate" => o.write_rate = Some(value("--write-rate")?.parse()?),
             "--ghost" => o.ghost = Some(value("--ghost")?.parse()?),
             "--slide" => o.slide = Some(value("--slide")?.parse()?),
+            "--scan" => o.scan = Some(value("--scan")?.parse()?),
             "--cell" => o.cell = Some(value("--cell")?.parse()?),
             "--no-autoclear" => o.autoclear = false,
             "--no-enhanced" => o.enhanced = false,
