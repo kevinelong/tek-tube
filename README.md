@@ -305,13 +305,18 @@ hardware was bought for.
 Driving a modern *interactive* shell is what does not work, for reasons that are
 the hardware's rather than the emulator's:
 
-* **VT positioning is discarded.**  `ESC[2J` (erase display), `ESC[H` (cursor
-  home) and `ESC[5;10H` (position) are swallowed rather than interpreted, so text
-  only ever flows onto the next line.  PSReadLine, progress bars and every full
-  screen TUI redraw with cursor moves and come out wrong.  Colour escapes are
-  swallowed too, which is the right answer for a monochrome green tube.
-* **There is no keyboard path.**  A real 4010 sends keystrokes back up the line;
-  this emulator has no input beyond ESC to quit.
+* **The VT parser is measured, not complete.**  It implements what a real
+  PowerShell session was observed to use - CUP (`ESC[H`, `ESC[5;10H`), erase of
+  the display, erase to end of line, erase *n* characters, cursor reports
+  (`CSI 6n`), scroll regions, the alternate screen and intensity SGR - because
+  that is what a console host and PSReadLine actually emit.  A full-screen
+  application leaning on the parts that were never seen is untested ground.
+  Colour escapes are swallowed, which is the right answer for a monochrome green
+  tube, and SGR intensity maps to stored charge: a storage tube cannot go above
+  full charge, so only "dim" is expressible.
+* **There is no keyboard path** on a *pipe* - a real 4010 sends keystrokes back
+  up the line and a plot file has nobody to send them to.  Terminal mode has
+  one; see below.
 * **A storage tube cannot scroll.**  Past its 35 row page the only thing to do is
   erase the whole screen (`--autoclear`, on by default), so a 60 line listing
   keeps only its last 25 lines - measured: 001-035 erased, 036-060 present.

@@ -2244,9 +2244,17 @@ mod split_speed {
             std::thread::available_parallelism(),
             auto_threads()
         );
+        // Compute-heavy on purpose.  A pass over 3.7M elements that only reads and
+        // writes floats is bound by memory bandwidth, and eight threads gain only
+        // about 1.4x on it - this test flaked against its own 1.43x threshold at
+        // 1.37x while a fullscreen terminal was rendering, which measures the
+        // machine rather than the splitter.  What it is *for* is catching a
+        // splitter that quietly runs everything on one thread, and a compute
+        // bound pass shows that plainly.
         fn work(y: usize, row: &mut [f32]) {
             for (x, v) in row.iter_mut().enumerate() {
-                *v = ((y * 7919 + x) as f32).sqrt();
+                let t = (y as f32 * 0.001 + x as f32 * 1e-4).sin();
+                *v = t.abs().powf(1.7) + (t * 3.0).cos().abs().sqrt();
             }
         }
         fn time(buf: &mut [f32], threads: usize) -> f64 {
