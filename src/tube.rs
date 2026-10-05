@@ -318,14 +318,31 @@ type Art = &'static [(f32, f32, f32, f32)];
 /// glyph.
 const ACS_ART: [Art; 32] = [
     /* _ blank        */ &[],
-    /* ` diamond      */ &[(0.5, 0.35, 0.72, 0.5), (0.72, 0.5, 0.5, 0.65), (0.5, 0.65, 0.28, 0.5), (0.28, 0.5, 0.5, 0.35)],
+    /* ` diamond      */
+    &[
+        (0.5, 0.35, 0.72, 0.5),
+        (0.72, 0.5, 0.5, 0.65),
+        (0.5, 0.65, 0.28, 0.5),
+        (0.28, 0.5, 0.5, 0.35),
+    ],
     /* a checkerboard */ &[],
     /* b              */ &[],
     /* c              */ &[],
     /* d              */ &[],
     /* e              */ &[],
-    /* f degree       */ &[(0.36, 0.74, 0.64, 0.74), (0.64, 0.74, 0.64, 0.94), (0.64, 0.94, 0.36, 0.94), (0.36, 0.94, 0.36, 0.74)],
-    /* g plus/minus   */ &[(0.25, 0.78, 0.75, 0.78), (0.5, 0.63, 0.5, 0.93), (0.25, 0.35, 0.75, 0.35)],
+    /* f degree       */
+    &[
+        (0.36, 0.74, 0.64, 0.74),
+        (0.64, 0.74, 0.64, 0.94),
+        (0.64, 0.94, 0.36, 0.94),
+        (0.36, 0.94, 0.36, 0.74),
+    ],
+    /* g plus/minus   */
+    &[
+        (0.25, 0.78, 0.75, 0.78),
+        (0.5, 0.63, 0.5, 0.93),
+        (0.25, 0.35, 0.75, 0.35),
+    ],
     /* h              */ &[],
     /* i              */ &[],
     /* j lower right  */ &[(0.5, 0.5, 0.0, 0.5), (0.5, 0.5, 0.5, 1.0)],
@@ -343,10 +360,30 @@ const ACS_ART: [Art; 32] = [
     /* v bottom tee   */ &[(0.0, 0.5, 1.0, 0.5), (0.5, 0.5, 0.5, 1.0)],
     /* w top tee      */ &[(0.0, 0.5, 1.0, 0.5), (0.5, 0.0, 0.5, 0.5)],
     /* x vertical     */ &[(0.5, 0.0, 0.5, 1.0)],
-    /* y <=           */ &[(0.75, 0.42, 0.3, 0.56), (0.3, 0.56, 0.75, 0.7), (0.25, 0.24, 0.8, 0.24)],
-    /* z >=           */ &[(0.25, 0.42, 0.7, 0.56), (0.7, 0.56, 0.25, 0.7), (0.2, 0.24, 0.75, 0.24)],
-    /* { pi           */ &[(0.2, 0.68, 0.8, 0.68), (0.35, 0.68, 0.35, 0.32), (0.65, 0.68, 0.65, 0.32)],
-    /* | not equal    */ &[(0.2, 0.4, 0.8, 0.4), (0.2, 0.62, 0.8, 0.62), (0.62, 0.28, 0.38, 0.74)],
+    /* y <=           */
+    &[
+        (0.75, 0.42, 0.3, 0.56),
+        (0.3, 0.56, 0.75, 0.7),
+        (0.25, 0.24, 0.8, 0.24),
+    ],
+    /* z >=           */
+    &[
+        (0.25, 0.42, 0.7, 0.56),
+        (0.7, 0.56, 0.25, 0.7),
+        (0.2, 0.24, 0.75, 0.24),
+    ],
+    /* { pi           */
+    &[
+        (0.2, 0.68, 0.8, 0.68),
+        (0.35, 0.68, 0.35, 0.32),
+        (0.65, 0.68, 0.65, 0.32),
+    ],
+    /* | not equal    */
+    &[
+        (0.2, 0.4, 0.8, 0.4),
+        (0.2, 0.62, 0.8, 0.62),
+        (0.62, 0.28, 0.38, 0.74),
+    ],
     /* } pound        */ &[],
     /* ~ middle dot   */ &[(0.5, 0.44, 0.5, 0.56)],
 ];
@@ -1121,7 +1158,14 @@ impl Tube {
     /// baselines line up - and covers the box a glyph can ink: the baseline's
     /// descender allowance below it and the cap height above.  Cached per glyph,
     /// because this is the same work for the same cell every time.
-    fn raster_glyph(&mut self, ch: u8, x: f32, y: f32, cell_w: i32, cell_h: i32) -> (u32, u32, Vec<bool>) {
+    fn raster_glyph(
+        &mut self,
+        ch: u8,
+        x: f32,
+        y: f32,
+        cell_w: i32,
+        cell_h: i32,
+    ) -> (u32, u32, Vec<bool>) {
         // the grid is the cell's: the rows are what was asked for, and keeping
         // the dots square sets the columns, so a wide cell simply has more of
         // them rather than stretched glyphs
@@ -1949,10 +1993,17 @@ mod tests {
         });
         assert_eq!(segs.len(), 1, "a rule is one stroke");
         let (x0, y0, x1, y1) = segs[0];
-        assert_eq!((x0, x1), (10.0, 24.0), "edge to edge, so the next cell joins");
+        assert_eq!(
+            (x0, x1),
+            (10.0, 24.0),
+            "edge to edge, so the next cell joins"
+        );
         assert_eq!(y0, y1, "and it is level");
 
-        assert_eq!(crate::tube::box_drawing_code('\u{250c}'), Some(0x80 + (b'l' - 0x5f)));
+        assert_eq!(
+            crate::tube::box_drawing_code('\u{250c}'),
+            Some(0x80 + (b'l' - 0x5f))
+        );
         assert_eq!(crate::tube::box_drawing_code('\u{2500}'), Some(rule));
         assert_eq!(crate::tube::glyph_code('\u{2502}'), 0x80 + (b'x' - 0x5f));
         // the special graphics codes pass straight through, ASCII stays itself,
@@ -2152,7 +2203,11 @@ mod tests {
 
         let reverse = cell(true);
         // the rule's own line is the hole the bar is cut around...
-        assert_eq!(at(&reverse, 40, 64), 0.0, "the glyph's own area is un-inked");
+        assert_eq!(
+            at(&reverse, 40, 64),
+            0.0,
+            "the glyph's own area is un-inked"
+        );
         // ...and the rest of the cell is filled, where the normal cell is bare
         assert!(at(&reverse, 40, 44) > 0.0, "the bar fills the cell");
         assert!(at(&reverse, 40, 84) > 0.0, "on both sides of the glyph");

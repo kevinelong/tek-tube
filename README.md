@@ -275,6 +275,16 @@ again.  A click on a slider jumps the value there and starts a drag; the wheel
 nudges the row under the pointer.  The panel is drawn over the frame that is
 already there, so it stays with the mouse while the costly half waits.
 
+Rows are sliders, boxes that toggle, lists that step, and **presets**: `wyse` and
+`tek` as bundles of rows, showing `custom` when the machine matches neither.
+They can be saved into numbered slots - `slot` names one, `save` writes the
+current rows into it - and the saved ones live in a plain-text file under the
+user's config directory, never in the repository.  A few rows are *launch* rows
+(`font` in the terminal; `device`, `zoom` and `shrink` in the plot path): they
+cannot take effect on a running window, so pressing one re-executes the program
+with the options the panel currently holds.  That ends the session, and the note
+line says so before it happens.
+
 For a plot file the window is the whole primary monitor and the face is rendered
 at the largest integer down-sample that fits the screen, then *centred without
 any scaling* (`ScaleMode::Center`), so nothing is resampled and the rest of the

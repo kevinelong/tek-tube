@@ -184,7 +184,8 @@ pub fn window_input(
                     continue;
                 }
                 let mut buf = [0u8; 4];
-                out.bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                out.bytes
+                    .extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
             }
             Input::Key(key, down) => {
                 match key {
@@ -478,8 +479,7 @@ impl Pen {
     pub fn stale(&self, screen: &vt::Screen) -> usize {
         (0..screen.cols * screen.rows)
             .filter(|i| {
-                self.drawn.get(*i).copied().unwrap_or((' ', false))
-                    != Self::drawn_want(screen, *i)
+                self.drawn.get(*i).copied().unwrap_or((' ', false)) != Self::drawn_want(screen, *i)
             })
             .count()
     }
@@ -740,20 +740,19 @@ impl Terminal {
         for arg in parts {
             cmd.arg(arg);
         }
-        // Say what kind of terminal this is.  TERM is normally inherited - a Git
-        // Bash parent has `xterm-256color` - but a shortcut or an Explorer launch
-        // has none, and a full screen program that reads TERM as unset or `dumb`
-        // draws a scrolled picture instead of using its screen.
+        // Say what kind of terminal this is.  The value is *forced*, not
+        // inherited: what is advertised has to be true, because over ssh it is
+        // what the far end believes and acts on.  A parent shell's
+        // `xterm-256color` asks the remote for 256 colours and a mouse on a
+        // monochrome storage tube, and its `dumb` makes a full screen program
+        // refuse to draw at all; `vt100` is the honest name now that the parser
+        // draws the special graphics set, carries DECSC/DECRC and sends
+        // application cursor keys.
         //
-        // What is advertised has to be *true*, because over ssh it is what the
-        // far end believes and acts on.  `vt100` is the honest name now that the
-        // parser draws the special graphics set, carries DECSC/DECRC and sends
-        // application cursor keys.  `xterm-256color` asked for 256 colours and a
-        // mouse on a monochrome storage tube, and `COLORTERM=truecolor` asked for
-        // 24 bit colour, which no parser can make true here.
-        if std::env::var_os("TERM").is_none() {
-            cmd.env("TERM", "vt100");
-        }
+        // TEK_TUBE_TERM overrides it, for the one case where the lie is the
+        // point: seeing what a real xterm-256color session would send.
+        let term = std::env::var("TEK_TUBE_TERM").unwrap_or_else(|_| "vt100".to_string());
+        cmd.env("TERM", term);
         cmd.env("TERM_PROGRAM", "tek-tube");
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
@@ -1124,7 +1123,8 @@ impl Terminal {
             self.quiet = 0.0;
             self.committed = false;
         }
-        let due = !self.committed && (self.quiet >= COMMIT_QUIET || self.since_commit >= COMMIT_MAX);
+        let due =
+            !self.committed && (self.quiet >= COMMIT_QUIET || self.since_commit >= COMMIT_MAX);
 
         changed || sliding || due || pen_work
     }
@@ -1209,7 +1209,14 @@ impl Terminal {
         }
         // remember the page as it now stands, for the next commit to compare
         self.snapshot_screen();
-        commit_to(tube, &self.screen, &mut self.pen, self.cols, self.rows, traced);
+        commit_to(
+            tube,
+            &self.screen,
+            &mut self.pen,
+            self.cols,
+            self.rows,
+            traced,
+        );
         self.page_replaced = false;
         self.committed = true;
         self.commits += 1;
@@ -1246,7 +1253,8 @@ impl Terminal {
     fn snapshot_flash(&mut self) {
         if self.flash_screen.len() != self.cols * self.rows {
             self.flash_screen.clear();
-            self.flash_screen.resize(self.cols * self.rows, (' ', false));
+            self.flash_screen
+                .resize(self.cols * self.rows, (' ', false));
         }
         for i in 0..self.cols * self.rows {
             let want = Pen::drawn_want(&self.screen, i);
@@ -1462,13 +1470,7 @@ pub fn stroke_changed(
 
 /// The cursor: an underline, drawn transiently.  On a storage tube the cursor
 /// *is* the beam position, so it is never committed.
-pub fn draw_cursor(
-    screen: &vt::Screen,
-    cols: usize,
-    rows: usize,
-    tube: &mut Tube,
-    write: Write,
-) {
+pub fn draw_cursor(screen: &vt::Screen, cols: usize, rows: usize, tube: &mut Tube, write: Write) {
     if !screen.cursor_visible {
         return;
     }
@@ -1577,12 +1579,48 @@ fn named_key(key: Key, app_cursor: bool) -> Option<&'static [u8]> {
         // DECCKM: in application cursor mode the arrows and Home/End are sent
         // with SS3 (`ESC O`) rather than CSI, which is what vim and less ask for
         // and what they match on.
-        Key::Up => if app_cursor { b"\x1bOA" } else { b"\x1b[A" },
-        Key::Down => if app_cursor { b"\x1bOB" } else { b"\x1b[B" },
-        Key::Right => if app_cursor { b"\x1bOC" } else { b"\x1b[C" },
-        Key::Left => if app_cursor { b"\x1bOD" } else { b"\x1b[D" },
-        Key::Home => if app_cursor { b"\x1bOH" } else { b"\x1b[H" },
-        Key::End => if app_cursor { b"\x1bOF" } else { b"\x1b[F" },
+        Key::Up => {
+            if app_cursor {
+                b"\x1bOA"
+            } else {
+                b"\x1b[A"
+            }
+        }
+        Key::Down => {
+            if app_cursor {
+                b"\x1bOB"
+            } else {
+                b"\x1b[B"
+            }
+        }
+        Key::Right => {
+            if app_cursor {
+                b"\x1bOC"
+            } else {
+                b"\x1b[C"
+            }
+        }
+        Key::Left => {
+            if app_cursor {
+                b"\x1bOD"
+            } else {
+                b"\x1b[D"
+            }
+        }
+        Key::Home => {
+            if app_cursor {
+                b"\x1bOH"
+            } else {
+                b"\x1b[H"
+            }
+        }
+        Key::End => {
+            if app_cursor {
+                b"\x1bOF"
+            } else {
+                b"\x1b[F"
+            }
+        }
         Key::PageUp => b"\x1b[5~",
         Key::PageDown => b"\x1b[6~",
         Key::Insert => b"\x1b[2~",
@@ -1609,7 +1647,10 @@ mod tests {
 
     #[test]
     fn keys_map_to_the_expected_sequences() {
-        assert_eq!(key_sequence(Key::Enter, false, false, false), Some(b"\r".to_vec()));
+        assert_eq!(
+            key_sequence(Key::Enter, false, false, false),
+            Some(b"\r".to_vec())
+        );
         assert_eq!(
             key_sequence(Key::Backspace, false, false, false),
             Some(b"\x7f".to_vec())
@@ -1627,7 +1668,10 @@ mod tests {
             Some(b"\x1b[15~".to_vec())
         );
         // Ctrl+C is C0 0x03 - PSReadLine needs this for copy and for interrupt
-        assert_eq!(key_sequence(Key::C, true, false, false), Some(b"\x03".to_vec()));
+        assert_eq!(
+            key_sequence(Key::C, true, false, false),
+            Some(b"\x03".to_vec())
+        );
         // Alt is an ESC prefix
         assert_eq!(
             key_sequence(Key::Enter, false, true, false),
@@ -1639,7 +1683,10 @@ mod tests {
         // for every key typed.  That was a real bug.
         assert_eq!(key_sequence(Key::A, false, false, false), None);
         assert_eq!(key_sequence(Key::Z, false, false, false), None);
-        assert_eq!(key_sequence(Key::A, true, false, false), Some(b"\x01".to_vec()));
+        assert_eq!(
+            key_sequence(Key::A, true, false, false),
+            Some(b"\x01".to_vec())
+        );
         // and keys we have no mapping for
         assert_eq!(key_sequence(Key::LeftShift, false, false, false), None);
         assert_eq!(key_sequence(Key::NumPad5, false, false, false), None);
@@ -1804,7 +1851,10 @@ mod tests {
             window_input(&up, Mods::default(), 17, false, false).bytes,
             b"\x1b[A"
         );
-        assert_eq!(window_input(&up, Mods::default(), 17, true, false).bytes, b"\x1bOA");
+        assert_eq!(
+            window_input(&up, Mods::default(), 17, true, false).bytes,
+            b"\x1bOA"
+        );
         let home = [Input::Key(Key::Home, true)];
         assert_eq!(
             window_input(&home, Mods::default(), 17, true, false).bytes,
@@ -1860,7 +1910,10 @@ mod tests {
             Input::Key(Key::Backspace, false),
             Input::Text('\x08'),
         ];
-        assert_eq!(window_input(&bs, Mods::default(), 17, false, false).bytes, b"\x7f");
+        assert_eq!(
+            window_input(&bs, Mods::default(), 17, false, false).bytes,
+            b"\x7f"
+        );
 
         let ctrl_c = [
             Input::Key(Key::LeftCtrl, true),
@@ -1887,7 +1940,10 @@ mod tests {
             Input::Text('b'),
             Input::Text('\t'),
         ];
-        assert_eq!(window_input(&events, Mods::default(), 17, false, false).bytes, b"ab");
+        assert_eq!(
+            window_input(&events, Mods::default(), 17, false, false).bytes,
+            b"ab"
+        );
     }
 
     /// The heart of terminal mode: content written while it is still moving
@@ -2052,9 +2108,8 @@ mod tests {
         let ch = (h / rows as i32).max(1);
         (0..rows)
             .map(|r| {
-                (r as i32 * ch..(r as i32 + 1) * ch).any(|y| {
-                    (0..w).any(|x| ((buf[(y * w + x) as usize] >> 8) & 0xff) > 140)
-                })
+                (r as i32 * ch..(r as i32 + 1) * ch)
+                    .any(|y| (0..w).any(|x| ((buf[(y * w + x) as usize] >> 8) & 0xff) > 140))
             })
             .collect()
     }
@@ -2079,7 +2134,10 @@ mod tests {
         pen.settle_drawn(&mut tube, &screen, 40, 6);
         tube.decay(600.0);
         let before = row_ink(&mut tube, 6);
-        assert!(before[0] && before[5], "six lines fill the page: {before:?}");
+        assert!(
+            before[0] && before[5],
+            "six lines fill the page: {before:?}"
+        );
 
         // one more line scrolls the page, and the screen says how far
         parser.feed(b"\r\nseven", &mut screen);
@@ -2105,7 +2163,10 @@ mod tests {
                 r + 1
             );
         }
-        assert!(after[5], "the line that scrolled in must be there: {after:?}");
+        assert!(
+            after[5],
+            "the line that scrolled in must be there: {after:?}"
+        );
     }
 
     /// Lit pixels in the rendered frame, the same band test the tube's own tests
@@ -2133,7 +2194,10 @@ mod tests {
         tube.capture_ghost();
 
         // the page moves: the next six lines are stamped where the old ones were
-        parser.feed(b"\r\nseven\r\neight\r\nnine\r\nten\r\neleven\r\ntwelve", &mut screen);
+        parser.feed(
+            b"\r\nseven\r\neight\r\nnine\r\nten\r\neleven\r\ntwelve",
+            &mut screen,
+        );
         tube.clear_stored();
         stroke_screen(&screen, 40, 6, &mut tube, Write::Settle, false);
 
@@ -2423,4 +2487,3 @@ mod tests {
         );
     }
 }
-

@@ -287,6 +287,9 @@ Usage: tek-tube [options] file.plt [more.plt ...]
   -h, --help this text
 
 Without --png/--png-seq a window opens (ESC quits).
+
+In terminal mode the type advertised to the shell (and so to anything it ssh's to)
+is vt100, forced rather than inherited; TEK_TUBE_TERM overrides it.
 ";
 
 /// A process that does not declare DPI awareness gets its window bitmap
@@ -543,7 +546,9 @@ fn run(mut opts: Options) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    run_window(&mut player, tw, th, &mut opts, fullscreen, screen)?;
+    if run_window(&mut player, tw, th, &mut opts, fullscreen, screen)? {
+        return relaunch_process(&opts);
+    }
     Ok(())
 }
 
@@ -812,6 +817,7 @@ fn slider(name: &'static str, min: f32, max: f32, value: f32, structural: bool) 
         kind: panel::Kind::Slider { min, max },
         value,
         structural,
+        launch: false,
     }
 }
 
@@ -821,53 +827,337 @@ fn toggle(name: &'static str, value: f32, structural: bool) -> panel::Row {
         kind: panel::Kind::Toggle,
         value,
         structural,
+        launch: false,
     }
 }
 
-/// A chooser: a row whose value is an index into a fixed list of names.
+/// A chooser: a row whose value is an index into a list of names.
 ///
 /// The preset row is the only one the panel offers.  A preset is not a value of
 /// its own - it is the *state* the other rows are in - so the index here is
 /// derived from them (see `preset_index`) rather than remembered, and only the
 /// press applies anything.
-fn choice(name: &'static str, list: &'static [&'static str], index: usize) -> panel::Row {
+///
+/// The list is owned because the preset chooser is the built-ins plus the names
+/// the user has saved, which the compiler cannot know.
+fn choice(name: &'static str, list: &[String], index: usize) -> panel::Row {
     panel::Row {
         name,
-        kind: panel::Kind::Choice(list),
+        kind: panel::Kind::Choice(list.to_vec()),
         value: index as f32,
         structural: false,
+        launch: false,
     }
 }
 
-/// The presets the chooser offers, in the order it lists them.  One past the end
-/// is `custom`: the rows match none of them.
+/// A chooser whose value can only be honoured by relaunching the program: a
+/// different target, page size or face is fixed when the process starts, so the
+/// panel offers it but the settle builds a fresh command line instead of applying
+/// the number to a machine that cannot read it.
+fn launch_choice(name: &'static str, list: &[&str], index: usize) -> panel::Row {
+    panel::Row {
+        name,
+        kind: panel::Kind::Choice(list.iter().map(|s| s.to_string()).collect()),
+        value: index as f32,
+        structural: false,
+        launch: true,
+    }
+}
+
+/// A compiled-in list of names as an owned one, for the choosers that need the
+/// panel's owned-list form.
+fn owned(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+/// The index of a name in a list, or one past the end when it is not there -
+/// which the panel shows as `custom`.
+fn index_of(list: &[&str], name: &str) -> usize {
+    list.iter().position(|s| *s == name).unwrap_or(list.len())
+}
+
+/// The `--font` spelling of a face, the form the parser accepts.
+fn face_name(face: Face) -> &'static str {
+    match face {
+        Face::Simplex => "simplex",
+        Face::Mono => "mono",
+        Face::Gothic => "gothic",
+    }
+}
+
+/// The `--device` spelling of a target.  Written out rather than taken from
+/// `Device::name`, which is prose for the startup banner and not a model number.
+fn device_name(dev: Device) -> &'static str {
+    match dev {
+        Device::Tek4010 => "4010",
+        Device::Tek4014 => "4014",
+    }
+}
+
+/// The terminal panel's relaunch rows.
+///
+/// `--font` was left out of the panel while the panel could only change live
+/// values: the face is fixed when the tube is built, so a row that moved an index
+/// nothing read would have been a lie.  As a relaunch row it is honest - it
+/// genuinely takes effect at launch - and it is the only way a running session can
+/// change face at all.
+const FONTS: &[&str] = &["simplex", "mono", "gothic"];
+
+/// The slots a save writes into.  There is no text entry on the panel, so a saved
+/// preset is named by the slot it went into rather than by anything the user
+/// types.
+const SAVE_SLOTS: &[&str] = &["user 1", "user 2", "user 3", "user 4"];
+
+/// The plot panel's relaunch rows: a different target is a different tube and a
+/// different decoder, and `--zoom` and `--shrink` size the window, which cannot
+/// change once it is made.
+const DEVICES: &[&str] = &["4010", "4014"];
+const ZOOMS: &[&str] = &["1", "2", "3", "4"];
+/// `auto` first: the fit decides, which is what an unset `--shrink` means.
+const SHRINKS: &[&str] = &["auto", "1", "2", "3", "4", "5", "6", "8"];
+
+/// The built-in presets the chooser offers, in the order it lists them.  The
+/// user's saved presets follow them; one past the end of the whole list is
+/// `custom`: the rows match none of them.
 const PRESETS: &[&str] = &["wyse", "tek"];
 
-/// Which preset the rows currently match, or `list.len()` for "custom".
+/// One preset: a name and the panel rows it sets.  The row names are owned
+/// because a saved one comes from the user's file, which may name a row this
+/// build has not got - that row is ignored rather than fatal.
+#[derive(Clone)]
+struct Preset {
+    name: String,
+    rows: Vec<(String, f32)>,
+}
+
+/// Every preset the chooser can offer: the built-ins, then the user's saved ones.
+///
+/// Carried by the caller rather than read from disk on every settle - the file
+/// changes only when a preset is saved, and the caller refreshes this then.
+/// Nothing here can fail: a missing or corrupt file is an empty list of user
+/// presets, and the built-ins are always there.
+struct Presets {
+    users: Vec<Preset>,
+}
+
+impl Presets {
+    /// The built-ins alone: what the panel offers when there is no config
+    /// directory, and what the tests use so the machine's own saved presets
+    /// cannot change what they measure.
+    fn builtins() -> Self {
+        Presets { users: Vec::new() }
+    }
+
+    /// Read the user's presets from the config file, if the environment names a
+    /// config directory at all.
+    fn load() -> Self {
+        Presets {
+            users: presets_path().map(|p| read_presets(&p)).unwrap_or_default(),
+        }
+    }
+
+    /// The chooser's entries, in the order it lists them: the built-ins first,
+    /// then the user's.
+    fn names(&self) -> Vec<String> {
+        PRESETS
+            .iter()
+            .map(|s| s.to_string())
+            .chain(self.users.iter().map(|p| p.name.clone()))
+            .collect()
+    }
+
+    /// The rows a named preset sets, built-in or saved, or `None` if the name is
+    /// no preset at all.
+    fn bundle(&self, name: &str) -> Option<Vec<(String, f32)>> {
+        if let Some(rows) = preset_rows(name) {
+            return Some(rows.iter().map(|(n, v)| (n.to_string(), *v)).collect());
+        }
+        self.users
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.rows.clone())
+    }
+}
+
+/// Where the user's saved presets live.
+///
+/// A preset belongs to the user, not to the repository and not to whatever
+/// directory the program happened to be started in, so it goes in the platform's
+/// per-user config directory: `%APPDATA%\tek-tube\presets.txt` on Windows and
+/// `$XDG_CONFIG_HOME/tek-tube/presets.txt` (falling back to
+/// `~/.config/tek-tube/presets.txt`) elsewhere.  `None` when the environment names
+/// no such directory: presets then simply are not persisted, and the panel offers
+/// the built-ins as it always did.
+fn presets_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|p| p.join("tek-tube").join("presets.txt"))
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(dir).join("tek-tube").join("presets.txt"));
+        }
+        std::env::var_os("HOME").map(|h| {
+            PathBuf::from(h)
+                .join(".config")
+                .join("tek-tube")
+                .join("presets.txt")
+        })
+    }
+}
+
+/// Read the user's presets.  A missing file, or one that has been corrupted, is
+/// an empty list: a saved preset is a convenience, and none of them is worth
+/// refusing to start over.
+fn read_presets(path: &std::path::Path) -> Vec<Preset> {
+    fs::read_to_string(path)
+        .map(|t| parse_presets(&t))
+        .unwrap_or_default()
+}
+
+/// Write the user's presets, making the directory if it is not there yet.
+fn write_presets(path: &std::path::Path, presets: &[Preset]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(path, format_presets(presets))
+}
+
+/// The file's text: one preset per line, the name then tab separated `row=value`
+/// pairs, so a name with a space in it ("user 1") needs no quoting.  Lines
+/// starting `#` are comments, which is also where the format documents itself.
+fn format_presets(presets: &[Preset]) -> String {
+    let mut s = String::from(
+        "# tek-tube panel presets: one per line, a name then tab separated row=value pairs\n",
+    );
+    for p in presets {
+        s.push_str(&p.name);
+        for (name, value) in &p.rows {
+            s.push('\t');
+            s.push_str(name);
+            s.push('=');
+            s.push_str(&value.to_string());
+        }
+        s.push('\n');
+    }
+    s
+}
+
+/// Parse the format `format_presets` writes.  Anything malformed is dropped
+/// rather than returned as an error: a value that is not a number is left out of
+/// its preset, and a line with no usable rows at all is not a preset at all - an
+/// empty bundle would match every machine.
+fn parse_presets(text: &str) -> Vec<Preset> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let rows = fields
+                .filter_map(|f| {
+                    let (row, value) = f.split_once('=')?;
+                    let value: f32 = value.trim().parse().ok()?;
+                    Some((row.trim().to_string(), value))
+                })
+                .collect::<Vec<(String, f32)>>();
+            (!rows.is_empty()).then(|| Preset {
+                name: name.to_string(),
+                rows,
+            })
+        })
+        .collect()
+}
+
+/// Whether a row is a view or a gesture rather than state a preset can set.  The
+/// preset chooser is derived from the other rows, the slot row names where a save
+/// goes, and the save row is the act of saving: a preset that carried any of them
+/// would be recording a gesture as a value.
+fn is_gesture(name: &str) -> bool {
+    matches!(name, "preset" | "slot" | "save")
+}
+
+/// Save the panel's current values as a user preset named `slot`, writing `path`.
+///
+/// Everything the panel sets except the chooser and the save row themselves -
+/// those are a view and a gesture, not state - so applying the saved preset later
+/// restores exactly what the machine was set to.  The file is written before the
+/// in-memory list is updated, so a failed write leaves the chooser unchanged.  The
+/// path is a parameter rather than resolved here so a test can point it at a file
+/// of its own instead of the user's real one.
+fn save_user_preset(
+    path: &std::path::Path,
+    slot: &str,
+    rows: &[panel::Row],
+    presets: &mut Presets,
+) -> Result<(), String> {
+    let bundle: Vec<(String, f32)> = rows
+        .iter()
+        .filter(|r| !is_gesture(r.name))
+        .map(|r| (r.name.to_string(), r.value))
+        .collect();
+    let mut users = presets.users.clone();
+    match users.iter_mut().find(|p| p.name == slot) {
+        Some(p) => p.rows = bundle,
+        None => users.push(Preset {
+            name: slot.to_string(),
+            rows: bundle,
+        }),
+    }
+    write_presets(path, &users).map_err(|e| format!("{}: {e}", path.display()))?;
+    presets.users = users;
+    Ok(())
+}
+
+/// Rebuild the preset chooser after a save: the list is the built-ins plus the
+/// saved names, so a freshly written preset must appear in it or the note would
+/// claim a save the chooser cannot offer.
+fn refresh_preset_choices(rows: &mut [panel::Row], presets: &Presets) {
+    if let Some(row) = rows.iter_mut().find(|r| r.name == "preset") {
+        row.kind = panel::Kind::Choice(presets.names());
+    }
+    sync_preset_row(rows, presets);
+}
+
+/// Which preset the rows currently match, or the list's length for "custom".
 ///
 /// A preset is derived, never stored.  Only the rows a preset *names* are
 /// compared, so a variable a preset says nothing about can never make the machine
 /// read as custom, and a small tolerance absorbs the rounding of a dragged
-/// slider.  The first match wins, which is the whole tie-break.
-fn preset_index(rows: &[panel::Row]) -> usize {
-    PRESETS
-        .iter()
+/// slider.  A saved preset may name a row this build has not got; that row is
+/// simply not compared, which is what "ignored for that option" means.  The first
+/// match wins, which is the whole tie-break.  The order and length come from the
+/// chooser row itself, so the index can never disagree with what is shown.
+fn preset_index(rows: &[panel::Row], presets: &Presets) -> usize {
+    let Some(row) = rows.iter().find(|r| r.name == "preset") else {
+        return 0;
+    };
+    let panel::Kind::Choice(list) = &row.kind else {
+        return 0;
+    };
+    list.iter()
         .position(|name| {
-            preset_rows(name).is_some_and(|bundle| {
+            presets.bundle(name).is_some_and(|bundle| {
                 bundle.iter().all(|(row_name, want)| {
                     rows.iter()
-                        .find(|r| r.name == *row_name)
+                        .find(|r| r.name == row_name.as_str())
                         .is_some_and(|r| (r.value - want).abs() < 1e-3)
                 })
             })
         })
-        .unwrap_or(PRESETS.len())
+        .unwrap_or(list.len())
 }
 
 /// Write the derived preset index into the `preset` row, so it reads the preset
 /// the machine is set to, or `custom` once one variable is nudged away.
-fn sync_preset_row(rows: &mut [panel::Row]) {
-    let index = preset_index(rows);
+fn sync_preset_row(rows: &mut [panel::Row], presets: &Presets) {
+    let index = preset_index(rows, presets);
     if let Some(row) = rows.iter_mut().find(|r| r.name == "preset") {
         row.value = index as f32;
     }
@@ -899,11 +1189,11 @@ static TEK: LazyLock<Vec<(&'static str, f32)>> = LazyLock::new(|| {
     let cell = fresh.cell.unwrap_or(terminal::CELL_SCALE_DEFAULT);
     let mut tube = Tube::new(1024, 780);
     configure_terminal_tube(&mut tube, Device::Tek4010, &fresh, cell);
-    raw_rows(&fresh, &tube)
+    raw_rows(&fresh, &tube, &Presets::builtins())
         .into_iter()
-        // the chooser is a view of the other rows, not one of them: a preset
-        // naming itself would be circular
-        .filter(|r| r.name != "preset")
+        // the chooser, the slot and the save row are views and gestures, not state
+        // a preset can set: a preset naming any of them would be circular
+        .filter(|r| !is_gesture(r.name))
         .map(|r| (r.name, r.value))
         .collect()
 });
@@ -921,16 +1211,19 @@ fn preset_rows(name: &str) -> Option<&'static [(&'static str, f32)]> {
     }
 }
 
-/// Apply a preset to the panel's rows: everything a preset press means.  Returns
-/// true if the page has to be written again, which only the cell size forces.
-fn apply_preset_rows(rows: &mut [panel::Row], name: &str) -> bool {
-    let Some(bundle) = preset_rows(name) else {
+/// Apply a preset to the panel's rows: everything a preset press means.  A saved
+/// preset goes through the same path as a built-in, so it cannot mean something
+/// different from one, and a row it names that this build has not got is left out
+/// rather than fatal.  Returns true if the page has to be written again, which
+/// only the cell size forces.
+fn apply_preset_rows(rows: &mut [panel::Row], name: &str, presets: &Presets) -> bool {
+    let Some(bundle) = presets.bundle(name) else {
         return false;
     };
     let cell_before = rows.iter().find(|r| r.name == "cell").map(|r| r.value);
-    for &(row_name, value) in bundle {
-        if let Some(row) = rows.iter_mut().find(|r| r.name == row_name) {
-            row.value = value;
+    for (row_name, value) in &bundle {
+        if let Some(row) = rows.iter_mut().find(|r| r.name == row_name.as_str()) {
+            row.value = *value;
         }
     }
     let cell_after = rows.iter().find(|r| r.name == "cell").map(|r| r.value);
@@ -942,11 +1235,11 @@ fn apply_preset_rows(rows: &mut [panel::Row], name: &str) -> bool {
 /// Read from the options, and for the ones the tube is *holding* (the phosphor
 /// gains, the scan, the ghost, the dot grid) from the tube, so the panel shows
 /// what the machine is set to rather than a parallel table of defaults.
-fn panel_rows(opts: &Options, tube: &Tube) -> Vec<panel::Row> {
-    let mut rows = raw_rows(opts, tube);
+fn panel_rows(opts: &Options, tube: &Tube, presets: &Presets) -> Vec<panel::Row> {
+    let mut rows = raw_rows(opts, tube, presets);
     // the chooser is a view of the rest, so it can only be filled in once they
     // have all been built
-    sync_preset_row(&mut rows);
+    sync_preset_row(&mut rows, presets);
     rows
 }
 
@@ -956,18 +1249,26 @@ fn panel_rows(opts: &Options, tube: &Tube) -> Vec<panel::Row> {
 /// defined - must not come back through `panel_rows` and ask `preset_index`, which
 /// asks *it*: that recursion overflowed the stack the moment the chooser was filled
 /// in at construction.
-fn raw_rows(opts: &Options, tube: &Tube) -> Vec<panel::Row> {
+fn raw_rows(opts: &Options, tube: &Tube, presets: &Presets) -> Vec<panel::Row> {
     let ph = &tube.phosphor;
     // Only the variables a *terminal* run honours.  --device, --zoom, --shrink,
-    // --text-scale, --threads, --no-autoclear, --no-enhanced and --font belong to
-    // the plot path (there is no 12 bit coordinate stream and no file being
-    // decoded here), so a control for them would move a number that nothing
-    // reads.
+    // --text-scale, --threads, --no-autoclear and --no-enhanced belong to the plot
+    // path (there is no 12 bit coordinate stream and no file being decoded here),
+    // so a control for them would move a number that nothing reads.  --font is
+    // honoured here - it sets the tube's face - but only when the tube is built,
+    // so it is a relaunch row rather than a live one.
     vec![
         // A preset is a *state*, not a value, so the rows start with one chooser
         // that shows which preset the values below it match.  It is filled in
         // once they exist, so the placeholder index here is never read.
-        choice("preset", PRESETS, 0),
+        choice("preset", &presets.names(), 0),
+        // Saving is a gesture the panel can express without a text entry: the
+        // slot row picks where it goes and the save row performs it.  A press on
+        // `save` writes the current rows into the shown slot, tells the note line
+        // which one, and flips itself back off, so it reads as a press rather than
+        // a state.
+        choice("slot", &owned(SAVE_SLOTS), 0),
+        toggle("save", 0.0, false),
         slider("baud", 0.0, 115200.0, opts.baud, false),
         slider("beam", 0.1, 2.0, opts.beam, false),
         slider("glow", 0.0, 2.0, opts.glow, false),
@@ -981,6 +1282,7 @@ fn raw_rows(opts: &Options, tube: &Tube) -> Vec<panel::Row> {
         slider("bloom-wide", 0.0, 0.3, ph.bloom_wide, false),
         slider("lens", 0.0, 1.2, ph.cam_blur, false),
         toggle("camera", opts.camera as u8 as f32, false),
+        launch_choice("font", FONTS, index_of(FONTS, face_name(opts.font))),
         slider("scan", 0.0, 0.95, ph.scan_depth, false),
         slider("dots", 0.0, 32.0, tube.dot_rows as f32, false),
         slider("trail", 0.0, 2.0, opts.trail.unwrap_or(1.1), false),
@@ -1051,11 +1353,47 @@ fn apply_value(opts: &mut Options, name: &str, v: f32) -> bool {
         "slide" => opts.slide = Some(v),
         "cell" => opts.cell = Some(v),
         "exit-after" => opts.exit_after = if v <= 0.0 { None } else { Some(v) },
+        // The relaunch rows.  Their value is a chooser index - the target is a
+        // `Device`, not a name - so the index becomes the option here, where every
+        // other row name becomes its option.  An index past the end is `custom`,
+        // which names no value and so leaves the option alone.
+        "device" => {
+            if let Some(name) = DEVICES.get(v.round().max(0.0) as usize) {
+                opts.device = match *name {
+                    "4010" => Device::Tek4010,
+                    _ => Device::Tek4014,
+                };
+            }
+        }
+        "font" => {
+            if let Some(name) = FONTS.get(v.round().max(0.0) as usize) {
+                opts.font = match *name {
+                    "mono" => Face::Mono,
+                    "gothic" => Face::Gothic,
+                    _ => Face::Simplex,
+                };
+            }
+        }
+        "zoom" => {
+            if let Some(name) = ZOOMS.get(v.round().max(0.0) as usize) {
+                opts.zoom = name.parse().unwrap_or(opts.zoom);
+            }
+        }
+        "shrink" => {
+            // `auto` is the entry that names no number: the option goes back to
+            // letting the fit decide what fits, which is what an unset --shrink
+            // means
+            if let Some(name) = SHRINKS.get(v.round().max(0.0) as usize) {
+                opts.shrink = name.parse().ok();
+            }
+        }
         // The chooser holds an index, not an option: pressing it applies a whole
         // preset, and the caller does that through the rows the preset names.
         // Handled so the mapping reports the name - the row is applied like any
-        // other - but it moves nothing itself.
-        "preset" => {}
+        // other - but it moves nothing itself.  The slot and save rows are the same:
+        // one names a slot and the other is the act of writing the file, and the
+        // caller does that.
+        "preset" | "slot" | "save" => {}
         _ => return false,
     }
     true
@@ -1093,12 +1431,13 @@ fn apply_rows(opts: &mut Options, rows: &[panel::Row]) -> bool {
 /// property of the player, which the settle re-derives, and `exit-after` is read
 /// every frame.
 ///
+/// The target, the zoom and the shrink are here as *relaunch* rows: each is a
+/// different tube, a different window or a different buffer, all decided when the
+/// process starts, so the panel offers them but a press builds a fresh command
+/// line instead of moving a number the running machine cannot read.
+///
 /// What is deliberately *not* here:
 ///
-/// * `device` - a different target is a different tube and a different decoder,
-///   which is a relaunch, not a row.
-/// * `zoom` and `shrink` - they size the window, which cannot change without
-///   rebuilding it; the row would move a number and nothing else.
 /// * `font` and `text-scale`, `autoclear`, `enhanced` - they change how *future*
 ///   bytes are drawn or decoded, so on a page already drawn they do nothing.
 /// * `png`, `png-at`, `png-seq`, `settle`, `frames`, `frame-dt`, `probe`,
@@ -1111,6 +1450,13 @@ fn apply_rows(opts: &mut Options, rows: &[panel::Row]) -> bool {
 fn plot_rows(opts: &Options, tube: &Tube) -> Vec<panel::Row> {
     let ph = &tube.phosphor;
     vec![
+        launch_choice(
+            "device",
+            DEVICES,
+            index_of(DEVICES, device_name(opts.device)),
+        ),
+        launch_choice("zoom", ZOOMS, index_of(ZOOMS, &opts.zoom.to_string())),
+        launch_choice("shrink", SHRINKS, shrink_index(opts.shrink)),
         slider("baud", 0.0, 115200.0, opts.baud, false),
         slider("speed", 0.0, 8.0, opts.speed, false),
         slider("beam", 0.1, 2.0, opts.beam, false),
@@ -1134,6 +1480,158 @@ fn plot_rows(opts: &Options, tube: &Tube) -> Vec<panel::Row> {
             false,
         ),
     ]
+}
+
+/// The shrink chooser's index: `auto` (0) when the fit is left to decide, else
+/// the entry for that number, or one past the end - `custom` - when the number is
+/// not one the list offers.
+fn shrink_index(shrink: Option<i32>) -> usize {
+    match shrink {
+        None => 0,
+        Some(n) => 1 + index_of(&SHRINKS[1..], &n.to_string()),
+    }
+}
+
+/// The command line that reproduces these options, for a relaunch.
+///
+/// Read from the options, not from the line this process was started with: a
+/// value set by hand in the panel exists only in the options, and rebuilding from
+/// the original line would silently discard it, making the panel a thing you
+/// could use once.  Only options that are *set* are written out, so an option left
+/// at its default is left to the default rather than frozen at the value this
+/// build happens to have.
+fn program_args(opts: &Options) -> Vec<String> {
+    fn val<T: ToString>(a: &mut Vec<String>, flag: &str, v: T) {
+        a.push(flag.to_string());
+        a.push(v.to_string());
+    }
+    fn opt<T: ToString>(a: &mut Vec<String>, flag: &str, v: Option<T>) {
+        if let Some(v) = v {
+            val(a, flag, v);
+        }
+    }
+    fn path_arg(a: &mut Vec<String>, flag: &str, v: Option<&PathBuf>) {
+        if let Some(p) = v {
+            a.push(flag.to_string());
+            a.push(p.display().to_string());
+        }
+    }
+
+    let mut a: Vec<String> = Vec::new();
+    val(&mut a, "--device", device_name(opts.device));
+    // only when it was given: an unpaced terminal is not the same as one paced at
+    // the default, so a baud that was never named must stay unnamed
+    if opts.baud_given {
+        val(&mut a, "--baud", opts.baud);
+    }
+    val(&mut a, "--speed", opts.speed);
+    val(&mut a, "--glow", opts.glow);
+    val(&mut a, "--beam", opts.beam);
+    val(&mut a, "--settle", opts.settle);
+    path_arg(&mut a, "--png", opts.png.as_ref());
+    opt(&mut a, "--png-at", opts.png_at);
+    opt(&mut a, "--png-seq", opts.png_seq.clone());
+    val(&mut a, "--frames", opts.frames);
+    val(&mut a, "--frame-dt", opts.frame_dt);
+    val(&mut a, "--zoom", opts.zoom);
+    opt(&mut a, "--shrink", opts.shrink);
+    if !opts.autoclear {
+        a.push("--no-autoclear".to_string());
+    }
+    if !opts.enhanced {
+        a.push("--no-enhanced".to_string());
+    }
+    opt(&mut a, "--store-gain", opts.store_gain);
+    opt(&mut a, "--fresh-gain", opts.fresh_gain);
+    opt(&mut a, "--sat", opts.sat);
+    opt(&mut a, "--ambient", opts.ambient);
+    opt(&mut a, "--mottle", opts.mottle);
+    opt(&mut a, "--bloom", opts.bloom);
+    opt(&mut a, "--bloom-wide", opts.bloom_wide);
+    if opts.camera {
+        a.push("--camera".to_string());
+    }
+    val(&mut a, "--font", face_name(opts.font));
+    val(&mut a, "--text-scale", opts.text_scale);
+    if opts.stats {
+        a.push("--stats".to_string());
+    }
+    if opts.dump_chars {
+        a.push("--dump-chars".to_string());
+    }
+    if let Some((x, y)) = opts.probe {
+        val(&mut a, "--probe", format!("{x},{y}"));
+    }
+    opt(&mut a, "--exit-after", opts.exit_after);
+    opt(&mut a, "--threads", opts.threads);
+    opt(&mut a, "--trail", opts.trail);
+    opt(&mut a, "--write-rate", opts.write_rate);
+    opt(&mut a, "--ghost", opts.ghost);
+    opt(&mut a, "--slide", opts.slide);
+    opt(&mut a, "--scan", opts.scan);
+    opt(&mut a, "--dots", opts.dots);
+    opt(&mut a, "--lens", opts.lens);
+    opt(&mut a, "--cell", opts.cell);
+    if opts.quiet {
+        a.push("--quiet".to_string());
+    }
+    a.push(
+        if opts.windowed {
+            "--windowed"
+        } else {
+            "--fullscreen"
+        }
+        .to_string(),
+    );
+
+    // The mode goes last, and the files after every flag, so a file whose name
+    // happens to look like an option cannot be taken for one.
+    if let Some(cmd) = &opts.shell {
+        a.push("--shell".to_string());
+        a.push(cmd.clone());
+    } else if let Some(p) = &opts.vt_replay {
+        a.push("--vt-replay".to_string());
+        a.push(p.display().to_string());
+    } else {
+        for f in &opts.files {
+            a.push(f.display().to_string());
+        }
+    }
+    a
+}
+
+/// Replace this program with a fresh one carrying the options as they stand.
+///
+/// The panel's relaunch rows - the target, the zoom, the shrink, the face - are
+/// fixed when the process starts: a different target is a different tube and a
+/// different decoder, and the window's size is decided before it is made.  Rather
+/// than offer a control that moves a number nothing reads, pressing one of those
+/// rows builds the command line it now means (see `program_args`) and starts the
+/// program again with it.
+///
+/// The session being replaced does not come back, which is why the panel says so
+/// on its note line before this runs.  On Unix the process image is replaced
+/// outright, so it is the same pid and no second console; on Windows there is no
+/// exec, so a new process is started and this one exits - as close as the platform
+/// allows.
+fn relaunch_process(opts: &Options) -> Result<(), Box<dyn Error>> {
+    let exe = std::env::current_exe()?;
+    let args = program_args(opts);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe).args(&args).exec();
+        // exec only returns on failure, so reaching here is the error case
+        Err(format!("could not relaunch {}: {err}", exe.display()).into())
+    }
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new(&exe)
+            .args(&args)
+            .spawn()
+            .map_err(|e| format!("could not relaunch {}: {e}", exe.display()))?;
+        std::process::exit(0);
+    }
 }
 
 /// Terminal mode: run a shell under a pseudoconsole and render it on the tube.
@@ -1196,9 +1694,16 @@ fn run_shell(command: &str, opts: &mut Options) -> Result<(), Box<dyn Error>> {
             "Ctrl+Shift+Q quits, or exit the shell.  ESC goes to the shell.  F11 toggles fullscreen."
         );
     }
-    run_terminal_window(
+    let relaunch = run_terminal_window(
         &mut term, &mut tube, dev, opts, fullscreen, screen, opts.quiet, cell,
-    )
+    )?;
+    // The shell has been stopped and the report printed by the time the window
+    // loop returns, so a relaunch here starts the fresh process with a clean
+    // exit behind it rather than orphaning a pty in a running console.
+    if relaunch {
+        return relaunch_process(opts);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1211,7 +1716,7 @@ fn run_terminal_window(
     screen: Option<(usize, usize)>,
     quiet: bool,
     cell_scale: f32,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<bool, Box<dyn Error>> {
     use minifb::{Key, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
     let started = Instant::now();
     // F11 out of a fullscreen start should land on the tube's own face rather
@@ -1231,6 +1736,15 @@ fn run_terminal_window(
     // seconds actually spent drawing a frame, so the rate reported is the cost of
     // a frame and not a session average diluted by the idle time between bursts
     let mut drawn_secs = 0.0f32;
+    // The presets the chooser offers, read once before the F11 loop: the file
+    // changes only when a preset is saved, and a save refreshes this, so a save
+    // survives a rebuild of the window.
+    let mut presets = Presets::load();
+    // Set when a relaunch row settled.  The session ends and a fresh process is
+    // started with the options, but not from here: the shell is stopped and the
+    // report printed first, so the ordinary shutdown path runs rather than being
+    // skipped by an exec in the middle of a frame.
+    let mut relaunch = false;
     // A window cannot change its own decorations, so F11 rebuilds it: one
     // window per state, and the shell and the tube simply carry on.
     loop {
@@ -1267,7 +1781,7 @@ fn run_terminal_window(
         // options panel is open it is drawn over a *copy* of the frame every
         // frame, so the panel follows the mouse without recomposing the tube.
         let mut frame: Vec<u32> = Vec::new();
-        let mut panel = panel::Panel::new(panel_rows(opts, tube));
+        let mut panel = panel::Panel::new(panel_rows(opts, tube, &presets));
         // the parameters the tube was built with, so a reconfigure from the panel
         // is a fresh configuration rather than a second coat of it
         let base_phosphor = tube.phosphor.clone();
@@ -1353,7 +1867,7 @@ fn run_terminal_window(
                 // the chooser is a view of the rows, so opening the panel is the
                 // moment to take a fresh reading of what the machine is set to
                 if panel.open {
-                    sync_preset_row(&mut panel.rows);
+                    refresh_preset_choices(&mut panel.rows, &presets);
                 }
                 dirty = true;
             }
@@ -1384,11 +1898,23 @@ fn run_terminal_window(
                 panel.handle(tube.w as usize, tube.h as usize, pos, down, 0.0);
                 if let Some(row) = panel.settle_due(Instant::now()) {
                     let name = panel.rows[row].name;
+                    if panel.rows[row].launch {
+                        // A relaunch row moves nothing the running tube can read: a
+                        // different face is fixed when the tube is built.  The panel
+                        // has already said on its note line that the session ends.
+                        // Everything set by hand is in the rows, so they are written
+                        // into the options and the caller builds the fresh command
+                        // line from those, not from the line this process was started
+                        // with.
+                        apply_rows(opts, &panel.rows);
+                        relaunch = true;
+                        break;
+                    }
                     // The chooser names the preset through what it *shows*, not
                     // through its own name, and `custom` - the value past the end
                     // of the list - names no preset at all, so it applies nothing.
                     let shown = panel.rows[row].shown();
-                    let preset = if name == "preset" && PRESETS.contains(&shown.as_str()) {
+                    let preset = if name == "preset" && presets.bundle(&shown).is_some() {
                         Some(shown)
                     } else {
                         None
@@ -1397,10 +1923,40 @@ fn run_terminal_window(
                     // bundle into the panel's own rows and the one mapping below
                     // applies them - which leaves the panel showing what is set
                     let rewrite = match &preset {
-                        Some(chosen) => apply_preset_rows(&mut panel.rows, chosen),
+                        Some(chosen) => apply_preset_rows(&mut panel.rows, chosen, &presets),
                         None => false,
                     };
                     apply_rows(opts, &panel.rows);
+                    // Saving is a gesture, not a value: the row names the slot and
+                    // pressing it writes the current rows there.  The note says which
+                    // slot and whether it worked, because the file is the only place
+                    // the result can be seen from the panel.
+                    if name == "save" && panel.rows[row].value > 0.5 {
+                        let slot_row = panel
+                            .rows
+                            .iter()
+                            .find(|r| r.name == "slot")
+                            .map(|r| r.value)
+                            .unwrap_or(0.0);
+                        let slot = SAVE_SLOTS[(slot_row as usize).min(SAVE_SLOTS.len() - 1)];
+                        panel.note = match presets_path() {
+                            Some(path) => {
+                                match save_user_preset(&path, slot, &panel.rows, &mut presets) {
+                                    Ok(()) => {
+                                        refresh_preset_choices(&mut panel.rows, &presets);
+                                        format!("saved as {slot}")
+                                    }
+                                    Err(e) => format!("save failed: {e}"),
+                                }
+                            }
+                            None => "no config directory to save into".to_string(),
+                        };
+                        // the button is a press, not a state: leave it off so the
+                        // next settle of any row does not save again
+                        if let Some(row) = panel.rows.iter_mut().find(|r| r.name == "save") {
+                            row.value = 0.0;
+                        }
+                    }
                     // the pen and the slide rates live in the terminal rather than
                     // in the options.  A preset names them, so they are pushed;
                     // a single row is only pushed when it is the row that moved, or
@@ -1431,7 +1987,7 @@ fn run_terminal_window(
                     // The chooser is a view of the other rows, so it is recomputed
                     // after every settle: nudging one variable away from a preset
                     // is what makes it read `custom`.
-                    sync_preset_row(&mut panel.rows);
+                    sync_preset_row(&mut panel.rows, &presets);
                     // the page follows from the options, so it is rebuilt through
                     // the same helpers the resize path uses
                     let cell_now = opts.cell.unwrap_or(terminal::CELL_SCALE_DEFAULT);
@@ -1574,7 +2130,7 @@ fn run_terminal_window(
             windowed_size = window.get_size();
         }
         drop(window);
-        if !toggle {
+        if !toggle || relaunch {
             break;
         }
         fullscreen = !fullscreen;
@@ -1600,7 +2156,7 @@ fn run_terminal_window(
             secs
         );
     }
-    Ok(())
+    Ok(relaunch)
 }
 
 fn run_window(
@@ -1610,7 +2166,7 @@ fn run_window(
     opts: &mut Options,
     start_fullscreen: bool,
     screen: Option<(usize, usize)>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<bool, Box<dyn Error>> {
     use minifb::{Key, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
     let dev = player.decoder.dev;
     let title = format!(
@@ -1643,6 +2199,9 @@ fn run_window(
             (th / shrink * opts.zoom) as usize,
         )
     };
+    // Set when a relaunch row settled, so the window loop ends and the process is
+    // replaced once the report has been printed.
+    let mut relaunch = false;
     loop {
         let (shrink, zoom, ow, oh) = fit(fullscreen, opts);
         // In fullscreen the window is the whole monitor and the tube face is placed
@@ -1749,10 +2308,19 @@ fn run_window(
                 let pos = (pos.0 - off.0, pos.1 - off.1);
                 let held = window.get_mouse_down(MouseButton::Left);
                 panel.handle(ow, oh, pos, held, 0.0);
-                if panel.settle_due(Instant::now()).is_some() {
+                if let Some(row) = panel.settle_due(Instant::now()) {
                     // the panel's rows are the source; the one mapping writes them
                     // into the options and the tube is configured from those
                     apply_rows(opts, &panel.rows);
+                    if panel.rows[row].launch {
+                        // A relaunch row - the target, the zoom, the shrink - is
+                        // fixed when the window is made, so there is nothing to
+                        // configure: the options now carry it and the caller builds
+                        // the fresh command line from them.  The panel has already
+                        // said on its note line that the session ends.
+                        relaunch = true;
+                        break;
+                    }
                     player.tube.phosphor = base_phosphor.clone();
                     configure_tube(&mut player.tube, dev, opts);
                     player.set_rate(opts);
@@ -1791,13 +2359,13 @@ fn run_window(
                 }
             }
         }
-        if !toggle {
+        if !toggle || relaunch {
             break;
         }
         fullscreen = !fullscreen;
     }
     report(player, opts);
-    Ok(())
+    Ok(relaunch)
 }
 
 fn report(player: &Player, opts: &Options) {
@@ -2299,7 +2867,7 @@ mod tests {
     fn the_panel_lists_live_variables_only() {
         let mut opts = Options::default();
         let tube = Tube::new(1024, 780);
-        let rows = panel_rows(&opts, &tube);
+        let rows = panel_rows(&opts, &tube, &Presets::builtins());
         assert!(rows.len() >= 20, "the panel lists the terminal's variables");
         assert_eq!(
             rows.iter().filter(|r| r.structural).count(),
@@ -2308,7 +2876,7 @@ mod tests {
         );
         let structural = apply_rows(&mut opts, &rows);
         assert!(structural, "the cell row is structural");
-        let again = panel_rows(&opts, &tube);
+        let again = panel_rows(&opts, &tube, &Presets::builtins());
         for (a, b) in rows.iter().zip(again.iter()) {
             assert_eq!(a.name, b.name);
             assert!(
@@ -2331,7 +2899,7 @@ mod tests {
 
         let mut opts = Options::default();
         opts.write_rate = Some(0.0);
-        let rows = panel_rows(&opts, &tube);
+        let rows = panel_rows(&opts, &tube, &Presets::builtins());
         let row = rows
             .iter()
             .find(|r| r.name == "write-rate")
@@ -2343,7 +2911,7 @@ mod tests {
         // with nothing given, the row shows the rate the pen is really running at
         // rather than a zero that would read as instant
         let mut fresh = Options::default();
-        let rows = panel_rows(&fresh, &tube);
+        let rows = panel_rows(&fresh, &tube, &Presets::builtins());
         let row = rows
             .iter()
             .find(|r| r.name == "write-rate")
@@ -2362,7 +2930,7 @@ mod tests {
     fn a_press_reaches_the_options_through_the_settle() {
         let mut opts = Options::default();
         let tube = Tube::new(1024, 780);
-        let mut panel = panel::Panel::new(panel_rows(&opts, &tube));
+        let mut panel = panel::Panel::new(panel_rows(&opts, &tube, &Presets::builtins()));
         panel.open = true;
         let (w, h) = (1024usize, 780usize);
 
@@ -2393,6 +2961,12 @@ mod tests {
         tube
     }
 
+    /// A row's value by name, for the tests that compare a machine against a
+    /// saved preset.
+    fn row_value(rows: &[panel::Row], name: &str) -> f32 {
+        rows.iter().find(|r| r.name == name).expect("the row").value
+    }
+
     /// A preset press sets the rows it names, and the values that follow from
     /// them.  `wyse` asks for an instant page *and* a paced link, which sounds
     /// contradictory until the terminal's two rates are told apart.
@@ -2400,17 +2974,17 @@ mod tests {
     fn a_preset_sets_the_rows_it_names() {
         let mut opts = Options::default();
         let mut tube = configured(Tube::new(1024, 780), &opts);
-        let mut rows = panel_rows(&opts, &tube);
+        let mut rows = panel_rows(&opts, &tube, &Presets::builtins());
 
         assert!(
-            !apply_preset_rows(&mut rows, "wyse"),
+            !apply_preset_rows(&mut rows, "wyse", &Presets::builtins()),
             "wyse leaves the cell alone, so the page stands"
         );
         apply_rows(&mut opts, &rows);
         tube = configured(tube, &opts);
         // the settle recomputes the chooser after applying, and so must the test
         // if it is to compare against rows the machine is really set to
-        sync_preset_row(&mut rows);
+        sync_preset_row(&mut rows, &Presets::builtins());
 
         let row = |name: &str| rows.iter().find(|r| r.name == name).expect("the row").value;
         assert_eq!(row("write-rate"), 0.0, "no beam writer");
@@ -2428,7 +3002,7 @@ mod tests {
         );
 
         // the panel is now showing what the reconfigured machine is set to
-        for r in panel_rows(&opts, &tube) {
+        for r in panel_rows(&opts, &tube, &Presets::builtins()) {
             assert!(
                 (r.value - row(r.name)).abs() < 1e-6,
                 "{} reads {} not {}",
@@ -2453,28 +3027,28 @@ mod tests {
         };
         let mut opts = Options::default();
         let mut tube = configured(Tube::new(1024, 780), &opts);
-        let mut rows = panel_rows(&opts, &tube);
+        let mut rows = panel_rows(&opts, &tube, &Presets::builtins());
 
         assert_eq!(
-            preset_index(&rows),
+            preset_index(&rows, &Presets::builtins()),
             1,
             "a fresh machine is the tek defaults"
         );
         assert_eq!(shown(&rows), "tek");
 
         // set to each preset in turn
-        apply_preset_rows(&mut rows, "wyse");
+        apply_preset_rows(&mut rows, "wyse", &Presets::builtins());
         apply_rows(&mut opts, &rows);
         tube = configured(tube, &opts);
-        rows = panel_rows(&opts, &tube);
-        assert_eq!(preset_index(&rows), 0);
+        rows = panel_rows(&opts, &tube, &Presets::builtins());
+        assert_eq!(preset_index(&rows, &Presets::builtins()), 0);
         assert_eq!(shown(&rows), "wyse");
 
-        apply_preset_rows(&mut rows, "tek");
+        apply_preset_rows(&mut rows, "tek", &Presets::builtins());
         apply_rows(&mut opts, &rows);
         tube = configured(tube, &opts);
-        rows = panel_rows(&opts, &tube);
-        assert_eq!(preset_index(&rows), 1);
+        rows = panel_rows(&opts, &tube, &Presets::builtins());
+        assert_eq!(preset_index(&rows, &Presets::builtins()), 1);
         assert_eq!(shown(&rows), "tek");
 
         // one value off a preset and the machine matches neither of them
@@ -2482,8 +3056,12 @@ mod tests {
             .find(|r| r.name == "beam")
             .expect("the beam row")
             .value = 1.4;
-        assert_eq!(preset_index(&rows), PRESETS.len(), "custom");
-        sync_preset_row(&mut rows);
+        assert_eq!(
+            preset_index(&rows, &Presets::builtins()),
+            PRESETS.len(),
+            "custom"
+        );
+        sync_preset_row(&mut rows, &Presets::builtins());
         assert_eq!(shown(&rows), "custom");
     }
 
@@ -2496,7 +3074,7 @@ mod tests {
     fn a_press_on_the_preset_row_applies_that_preset() {
         let mut opts = Options::default();
         let tube = configured(Tube::new(1024, 780), &opts);
-        let mut rows = panel_rows(&opts, &tube);
+        let mut rows = panel_rows(&opts, &tube, &Presets::builtins());
         assert_eq!(rows[0].name, "preset");
 
         // the chooser has moved to wyse, so that is the preset that applies
@@ -2504,7 +3082,7 @@ mod tests {
         let chosen = rows[0].shown();
         assert_eq!(chosen, "wyse");
         assert!(
-            !apply_preset_rows(&mut rows, &chosen),
+            !apply_preset_rows(&mut rows, &chosen, &Presets::builtins()),
             "wyse leaves the cell alone, so the page stands"
         );
         apply_rows(&mut opts, &rows);
@@ -2514,7 +3092,7 @@ mod tests {
         // the chooser's own name must be handled, or the settle's guard fires
         assert!(apply_value(&mut opts, "preset", 1.0), "the name is handled");
         // and after the settle the chooser reads the machine it produced
-        sync_preset_row(&mut rows);
+        sync_preset_row(&mut rows, &Presets::builtins());
         assert_eq!(rows[0].shown(), "wyse");
 
         // `custom` names no preset, so it applies none of them
@@ -2522,7 +3100,7 @@ mod tests {
         assert_eq!(rows[0].shown(), "custom");
         let chosen = rows[0].shown();
         let before: Vec<f32> = rows.iter().map(|r| r.value).collect();
-        assert!(!apply_preset_rows(&mut rows, &chosen));
+        assert!(!apply_preset_rows(&mut rows, &chosen, &Presets::builtins()));
         assert_eq!(before, rows.iter().map(|r| r.value).collect::<Vec<f32>>());
     }
 
@@ -2532,7 +3110,7 @@ mod tests {
     fn the_tek_preset_is_a_fresh_machine() {
         let mut opts = Options::default();
         let tube = configured(Tube::new(1024, 780), &opts);
-        let mut rows = panel_rows(&opts, &tube);
+        let mut rows = panel_rows(&opts, &tube, &Presets::builtins());
         // move several rows away from the defaults first
         for r in rows.iter_mut() {
             match r.name {
@@ -2545,14 +3123,17 @@ mod tests {
         }
 
         assert!(
-            apply_preset_rows(&mut rows, "tek"),
+            apply_preset_rows(&mut rows, "tek", &Presets::builtins()),
             "the cell came back from 3.0, so the page must be written again"
         );
         apply_rows(&mut opts, &rows);
 
         let fresh_opts = Options::default();
         let fresh_tube = configured(Tube::new(1024, 780), &fresh_opts);
-        for (r, f) in rows.iter().zip(panel_rows(&fresh_opts, &fresh_tube).iter()) {
+        for (r, f) in rows
+            .iter()
+            .zip(panel_rows(&fresh_opts, &fresh_tube, &Presets::builtins()).iter())
+        {
             assert_eq!(r.name, f.name);
             assert!(
                 (r.value - f.value).abs() < 1e-6,
@@ -2565,7 +3146,172 @@ mod tests {
 
         // a name that is not a preset does nothing at all
         let before: Vec<f32> = rows.iter().map(|r| r.value).collect();
-        assert!(!apply_preset_rows(&mut rows, "nope"));
+        assert!(!apply_preset_rows(&mut rows, "nope", &Presets::builtins()));
         assert_eq!(before, rows.iter().map(|r| r.value).collect::<Vec<f32>>());
+    }
+
+    /// A relaunch is a fresh command line built from the options as they stand,
+    /// never from the line the process was started with: a value set by hand in
+    /// the panel exists nowhere else, and losing it would make the panel a thing
+    /// you can use once.  The strongest statement that the rebuilt line means what
+    /// it says is to hand it back to the program's own parser and compare.
+    #[test]
+    fn a_relaunch_command_line_round_trips_the_live_options() {
+        let mut opts = Options::default();
+        opts.files = vec![PathBuf::from("plot.plt")];
+        // as a panel would leave them: a new target and face, a zoom, a hand-set
+        // beam, and a baud that was given
+        apply_value(&mut opts, "device", 0.0); // the 4010 entry
+        apply_value(&mut opts, "font", 2.0); // the gothic entry
+        apply_value(&mut opts, "zoom", 3.0); // the "4" entry
+        opts.beam = 0.8;
+        opts.baud = 9600.0;
+        opts.baud_given = true;
+
+        let args = program_args(&opts);
+        let at = args
+            .iter()
+            .position(|a| a == "--device")
+            .expect("--device is written out");
+        assert_eq!(args[at + 1], "4010", "the target the panel set");
+        assert_eq!(args.last().map(String::as_str), Some("plot.plt"));
+
+        let back = parse_args_from(args.into_iter())
+            .expect("the program's own parser accepts it")
+            .expect("not a help request");
+        assert_eq!(back.device, Device::Tek4010);
+        assert_eq!(back.font, Face::Gothic);
+        assert_eq!(back.zoom, 4);
+        assert_eq!(back.beam, 0.8);
+        assert_eq!(back.baud, 9600.0);
+        assert!(back.baud_given, "a paced link stays paced");
+        assert_eq!(back.files, vec![PathBuf::from("plot.plt")]);
+    }
+
+    /// A terminal relaunch names the shell and the face and no files, so the fresh
+    /// process comes back as a terminal rather than trying to play a plot.
+    #[test]
+    fn a_terminal_relaunch_keeps_the_shell_and_the_face() {
+        let mut opts = Options::default();
+        opts.shell = Some("powershell.exe".to_string());
+        apply_value(&mut opts, "font", 2.0); // gothic
+
+        let back = parse_args_from(program_args(&opts).into_iter())
+            .expect("accepted")
+            .expect("not a help request");
+        assert_eq!(back.shell.as_deref(), Some("powershell.exe"));
+        assert_eq!(back.font, Face::Gothic);
+        assert!(back.files.is_empty());
+    }
+
+    /// A preset saved from the panel is written in a plain text file and read back
+    /// as a preset of the same name, applied through the very path a built-in
+    /// uses - so a saved preset cannot mean something different from a built-in.
+    #[test]
+    fn a_saved_preset_reads_back_and_applies_like_a_built_in() {
+        // a file of its own, so the machine's real presets are never touched
+        let dir = std::env::temp_dir().join(format!("tek-tube-saved-{}", std::process::id()));
+        let path = dir.join("presets.txt");
+        let _ = fs::remove_dir_all(&dir);
+
+        let opts = Options::default();
+        let tube = configured(Tube::new(1024, 780), &opts);
+        let mut rows = panel_rows(&opts, &tube, &Presets::builtins());
+        // the user nudges two rows and saves them
+        rows.iter_mut()
+            .find(|r| r.name == "beam")
+            .expect("beam")
+            .value = 0.9;
+        rows.iter_mut()
+            .find(|r| r.name == "scan")
+            .expect("scan")
+            .value = 0.4;
+        let mut presets = Presets::builtins();
+        save_user_preset(&path, "user 1", &rows, &mut presets).expect("the file is writable");
+
+        // a fresh process reads the file back
+        let presets = Presets {
+            users: read_presets(&path),
+        };
+        assert_eq!(
+            presets.names(),
+            vec!["wyse".to_string(), "tek".to_string(), "user 1".to_string()],
+            "the saved preset joins the chooser after the built-ins"
+        );
+
+        // apply it to a machine at the defaults, through the same rows path
+        let opts2 = Options::default();
+        let tube2 = configured(Tube::new(1024, 780), &opts2);
+        let mut rows2 = panel_rows(&opts2, &tube2, &presets);
+        apply_preset_rows(&mut rows2, "user 1", &presets);
+        assert_eq!(row_value(&rows2, "beam"), 0.9);
+        assert_eq!(row_value(&rows2, "scan"), 0.4);
+        // and the chooser now reads the saved preset
+        sync_preset_row(&mut rows2, &presets);
+        assert_eq!(
+            rows2
+                .iter()
+                .find(|r| r.name == "preset")
+                .expect("the row")
+                .shown(),
+            "user 1"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A saved preset from an older build may name a row this one has not got.
+    /// The row is dropped and the rest of the preset still applies: a stale file
+    /// must not be fatal, or a build that renames a row would take every saved
+    /// preset with it.
+    #[test]
+    fn a_saved_preset_naming_a_row_this_build_lacks_still_applies() {
+        let presets = Presets {
+            users: vec![Preset {
+                name: "user 9".to_string(),
+                rows: vec![
+                    ("beam".to_string(), 0.7),
+                    ("a row from another build".to_string(), 1.0),
+                ],
+            }],
+        };
+        let opts = Options::default();
+        let tube = configured(Tube::new(1024, 780), &opts);
+        let mut rows = panel_rows(&opts, &tube, &presets);
+        apply_preset_rows(&mut rows, "user 9", &presets);
+        assert_eq!(row_value(&rows, "beam"), 0.7, "the known row still applies");
+    }
+
+    /// A missing or corrupt preset file is an empty list rather than a crash: the
+    /// panel is a convenience, and no saved preset is worth refusing to start
+    /// over.  A line that is not a preset, a value that is not a number and a
+    /// preset with no usable rows are all dropped.
+    #[test]
+    fn a_missing_or_corrupt_preset_file_is_handled() {
+        let missing = std::env::temp_dir().join("tek-tube-presets-that-are-not-there.txt");
+        let _ = fs::remove_file(&missing);
+        assert!(read_presets(&missing).is_empty(), "a missing file is empty");
+
+        let text = "# a comment\n\
+                    user 1\tbeam=0.9\tscan=nonsense\n\
+                    \n\
+                    not a preset\t\n\
+                    user 2\tglow=0.2\n";
+        let presets = parse_presets(text);
+        assert_eq!(presets.len(), 2, "the two usable lines survive");
+        assert_eq!(presets[0].name, "user 1");
+        assert_eq!(
+            presets[0].rows,
+            vec![("beam".to_string(), 0.9f32)],
+            "the value that is not a number is dropped, the good pair stays"
+        );
+        assert_eq!(presets[1].name, "user 2");
+        assert_eq!(presets[1].rows, vec![("glow".to_string(), 0.2f32)]);
+
+        // and what is written back is what is read, so a save survives the round
+        // trip through the file
+        let round = parse_presets(&format_presets(&presets));
+        assert_eq!(round.len(), presets.len());
+        assert_eq!(round[0].name, presets[0].name);
+        assert_eq!(round[0].rows, presets[0].rows);
     }
 }

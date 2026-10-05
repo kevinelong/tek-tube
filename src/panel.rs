@@ -28,7 +28,11 @@ pub enum Kind {
     /// A list stepped through with the mouse or the keyboard; `value` is the index
     /// into `list`.  An index one past the end means "custom" - the caller sets it
     /// when the running values match no entry - and it is what is shown then.
-    Choice(&'static [&'static str]),
+    ///
+    /// The list is owned rather than borrowed for the whole program's life: the
+    /// preset chooser is the built-ins plus the names the user has saved, and a
+    /// saved name is not known when the program is compiled.
+    Choice(Vec<String>),
 }
 
 /// One adjustable variable: a name, a control, its value.
@@ -42,12 +46,19 @@ pub struct Row {
     /// written again (the face, the device, the geometry) rather than just
     /// recomposed.
     pub structural: bool,
+    /// Whether the value can only be honoured by *relaunching* the program with
+    /// it, rather than by feeding it to the running tube.  A different target,
+    /// a different window size or a different face is fixed when the process
+    /// starts, so the panel still steps and draws the row like any other, but
+    /// the caller works out a fresh command line when the change settles instead
+    /// of applying the number to a machine that cannot read it.
+    pub launch: bool,
 }
 
 impl Row {
     /// The value as it is shown beside the control.
     pub fn shown(&self) -> String {
-        match self.kind {
+        match &self.kind {
             Kind::Slider { .. } => format!("{:.3}", self.value),
             Kind::Toggle => if self.value > 0.5 { "on" } else { "off" }.to_string(),
             // An index at or past the end is not an error: it is the custom state,
@@ -55,9 +66,8 @@ impl Row {
             // entry, and "custom" is what the user is shown.
             Kind::Choice(list) => list
                 .get(self.value as usize)
-                .copied()
-                .unwrap_or("custom")
-                .to_string(),
+                .cloned()
+                .unwrap_or_else(|| "custom".to_string()),
         }
     }
 }
@@ -219,39 +229,42 @@ impl Panel {
         let m = self.metrics(h);
         let cx = self.control_x(h);
         let mut changed = false;
-        match self.rows[i].kind {
-            Kind::Slider { min, max } => match act {
-                Act::Click(px) => {
-                    let (t0, t1) = (cx as f32, (cx + m.track_w) as f32);
-                    let t = ((px - t0) / (t1 - t0)).clamp(0.0, 1.0);
-                    let v = min + (max - min) * t;
-                    if (v - self.rows[i].value).abs() > 1e-9 {
-                        self.rows[i].value = v;
-                        changed = true;
+        match &self.rows[i].kind {
+            Kind::Slider { min, max } => {
+                let (min, max) = (*min, *max);
+                match act {
+                    Act::Click(px) => {
+                        let (t0, t1) = (cx as f32, (cx + m.track_w) as f32);
+                        let t = ((px - t0) / (t1 - t0)).clamp(0.0, 1.0);
+                        let v = min + (max - min) * t;
+                        if (v - self.rows[i].value).abs() > 1e-9 {
+                            self.rows[i].value = v;
+                            changed = true;
+                        }
+                    }
+                    Act::Enter => {
+                        // no pointer to jump to, so step: a twentieth of the range is
+                        // coarse enough to feel like a press, and it wraps past the top
+                        // back to the bottom so the whole range is reachable from the
+                        // keyboard alone.
+                        let step = (max - min) / 20.0;
+                        let v = self.rows[i].value + step;
+                        let v = if v > max { min } else { v };
+                        if (v - self.rows[i].value).abs() > 1e-9 {
+                            self.rows[i].value = v;
+                            changed = true;
+                        }
+                    }
+                    Act::Wheel(d) => {
+                        let step = (max - min) / 200.0;
+                        let v = (self.rows[i].value + d * step).clamp(min, max);
+                        if (v - self.rows[i].value).abs() > 1e-9 {
+                            self.rows[i].value = v;
+                            changed = true;
+                        }
                     }
                 }
-                Act::Enter => {
-                    // no pointer to jump to, so step: a twentieth of the range is
-                    // coarse enough to feel like a press, and it wraps past the top
-                    // back to the bottom so the whole range is reachable from the
-                    // keyboard alone.
-                    let step = (max - min) / 20.0;
-                    let v = self.rows[i].value + step;
-                    let v = if v > max { min } else { v };
-                    if (v - self.rows[i].value).abs() > 1e-9 {
-                        self.rows[i].value = v;
-                        changed = true;
-                    }
-                }
-                Act::Wheel(d) => {
-                    let step = (max - min) / 200.0;
-                    let v = (self.rows[i].value + d * step).clamp(min, max);
-                    if (v - self.rows[i].value).abs() > 1e-9 {
-                        self.rows[i].value = v;
-                        changed = true;
-                    }
-                }
-            },
+            }
             Kind::Toggle => {
                 // a box flips on a press; the wheel is not a press, so it leaves
                 // the box alone rather than toggling it under a stray scroll
@@ -294,7 +307,19 @@ impl Panel {
         }
         if changed {
             self.touched(i);
-            self.note = format!("{} = {}", self.rows[i].name, self.rows[i].shown());
+            // A row that can only be honoured by starting over says so here,
+            // before anything happens: the note line exists so the machine never
+            // does something the user was not told about, and a session being
+            // replaced is the largest thing it does.
+            self.note = if self.rows[i].launch {
+                format!(
+                    "{} = {} - relaunch: session ends",
+                    self.rows[i].name,
+                    self.rows[i].shown()
+                )
+            } else {
+                format!("{} = {}", self.rows[i].name, self.rows[i].shown())
+            };
         }
         changed
     }
@@ -368,7 +393,7 @@ impl Panel {
             if py < (y - 2) as f32 || py > (y + m.row_h - 2) as f32 {
                 continue;
             }
-            let act = match self.rows[i].kind {
+            let act = match &self.rows[i].kind {
                 Kind::Slider { .. } => {
                     if down && px >= t0 - 6.0 && px <= t1 + 6.0 {
                         self.dragging = Some(i);
@@ -453,8 +478,9 @@ impl Panel {
             }
             text(buf, rx + m.cell_w + 2, ry, row.name, label);
             let mid = ry + m.row_h / 2;
-            match row.kind {
+            match &row.kind {
                 Kind::Slider { min, max } => {
+                    let (min, max) = (*min, *max);
                     rect(buf, w, h, cx, mid - 1, m.track_w, 3, track_c);
                     let t = if max > min {
                         ((row.value - min) / (max - min)).clamp(0.0, 1.0)
@@ -580,6 +606,11 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// An owned choice list, the way the caller now has to build one.
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
     fn panel() -> Panel {
         Panel::new(vec![
             Row {
@@ -587,18 +618,21 @@ mod tests {
                 kind: Kind::Slider { min: 0.0, max: 1.0 },
                 value: 0.5,
                 structural: false,
+                launch: false,
             },
             Row {
                 name: "cell",
                 kind: Kind::Slider { min: 0.5, max: 3.0 },
                 value: 1.0,
                 structural: true,
+                launch: false,
             },
             Row {
                 name: "camera",
                 kind: Kind::Toggle,
                 value: 1.0,
                 structural: false,
+                launch: false,
             },
         ])
     }
@@ -611,15 +645,17 @@ mod tests {
         Panel::new(vec![
             Row {
                 name: "face",
-                kind: Kind::Choice(&["mono", "gothic", "simplex"]),
+                kind: Kind::Choice(names(&["mono", "gothic", "simplex"])),
                 value: 0.0,
                 structural: false,
+                launch: false,
             },
             Row {
                 name: "beam",
                 kind: Kind::Slider { min: 0.0, max: 1.0 },
                 value: 0.5,
                 structural: false,
+                launch: false,
             },
         ])
     }
@@ -722,6 +758,7 @@ mod tests {
                 kind: Kind::Slider { min: 0.0, max: 1.0 },
                 value: i as f32,
                 structural: false,
+                launch: false,
             })
             .collect();
         for (w, h) in [(1024usize, 780usize), (2560, 1440), (640, 400)] {
@@ -831,5 +868,48 @@ mod tests {
         p.toggle();
         assert!(p.open, "reopened");
         assert_eq!(p.selected(), 0, "and the highlight is back at the top");
+    }
+
+    /// A row that can only be honoured by starting the program again says so on
+    /// the note line the moment it is pressed - the note is the only warning the
+    /// user gets that the session is about to be replaced - and it is not a
+    /// reconfigure of the tube, which could not make the change.
+    #[test]
+    fn a_launch_row_says_the_session_ends() {
+        let mut p = Panel::new(vec![Row {
+            name: "device",
+            kind: Kind::Choice(names(&["4010", "4014"])),
+            value: 0.0,
+            structural: false,
+            launch: true,
+        }]);
+        p.open = true;
+        assert!(p.key(PanelKey::Enter, W, H), "the press moved the row");
+        assert_eq!(p.rows[0].shown(), "4014");
+        assert!(
+            p.note.contains("session ends"),
+            "the note must say the session ends: {}",
+            p.note
+        );
+        assert!(!p.needs_rebuild, "a relaunch is not a tube reconfigure");
+    }
+
+    /// A choice list built while the program runs - the built-in presets plus
+    /// whatever the user has saved - is stepped exactly like a compiled-in one,
+    /// and the entries past the compiled-in ones are reachable.
+    #[test]
+    fn a_choice_list_built_at_run_time_can_be_stepped() {
+        let mut p = Panel::new(vec![Row {
+            name: "preset",
+            kind: Kind::Choice(names(&["wyse", "tek", "user 1", "user 2"])),
+            value: 0.0,
+            structural: false,
+            launch: false,
+        }]);
+        p.open = true;
+        for want in ["tek", "user 1", "user 2", "wyse"] {
+            p.key(PanelKey::Enter, W, H);
+            assert_eq!(p.rows[0].shown(), want);
+        }
     }
 }

@@ -97,13 +97,28 @@ the **DEC special graphics set** (`ESC ( 0`, which programs select around a fram
 and put back with `ESC ( B`) and the **UTF-8 box-drawing characters** a modern
 program sends instead - `vim`, `htop` and `tmux` mostly use the second.  Cursor
 keys follow **DECCKM**, so `vim` and `less` get the `ESC O A` form they ask for.
-Colour is swallowed by design (one phosphor), reverse video cannot be drawn on a
-storage tube at all, and there is no mouse reporting.
+Tab stops are the program's rather than a fixed grid (`ESC H`, `CSI g/I/Z`), and
+DECOM, DECSTR and scroll-down are honoured.  Mouse tracking is reported to the
+program - `CSI ?1000/?1002/?1003`, with `?1006` SGR encoding, presses and releases
+always and drags or bare motion only in the modes that ask for them - and not while
+the panel is open, where the mouse belongs to the panel.  `ESC #` double-width and
+-height lines are consumed and recorded but not yet drawn at double size, and
+`CSI ?3` (132 columns) is consumed without resizing: the page shape is the face's
+own.
 
-The type advertised to the child is `vt100` when nothing in the environment says
-otherwise, because that is what is true: over ssh it is what the far end believes
-and acts on, and `xterm-256color` asked for 256 colours and a mouse that do not
-exist here.
+Colour is swallowed by design (one phosphor).  **Reverse video is drawn**, as a
+stencil: the cell is filled with the pen and the glyph is cut out of it, so a bar
+reads as inverted even though stored charge cannot be un-written.  Its cost is
+worth knowing - roughly 1,200 dots of pen travel per reversed cell against sixty
+for a letter - because a *traced* status line takes seconds, while a full-screen
+application pays it once per wholesale repaint.
+
+The type told to the child is `vt100`, **forced** rather than inherited, because
+over ssh it is what the far end believes and acts on: an inherited
+`xterm-256color` asks the remote for 256 colours and a mouse on a monochrome
+storage tube, and an inherited `dumb` makes a full-screen program refuse to draw at
+all.  `TEK_TUBE_TERM` overrides it, for the one case where advertising an xterm is
+the point.
 
 **Doubled drawing, found by recording the window.**  A `cls` followed by a long
 listing was recorded frame by frame from the live window (grabber and analysis in
