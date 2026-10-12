@@ -514,6 +514,24 @@ pub struct Tube {
     /// headless run can be shown to have taken one.
     pub ghosted_cells: usize,
 
+    /// The cursor's underline, as `(x0, x1, y0, y1)` in target dots, drawn into
+    /// the frame as light of its own.
+    ///
+    /// Not charge, and deliberately not a *flash* either.  A cursor has to be
+    /// visible whenever the shell is waiting, and the two ways a storage tube can
+    /// offer that both fail: charged into the image it would be permanent (and
+    /// leave a trail of itself wherever it moved), and written transiently it
+    /// fades within a second and the tube is left with no cursor at all.  The
+    /// hardware's own hosts wrote a cursor as *stored* ink and redrew the page to
+    /// move it, which is a steady mark - so this is a steady mark, drawn at the
+    /// level stored ink reaches, over the phosphor rather than in it.
+    ///
+    /// Because it is not a population, it does not make the tube *alive*: a tube
+    /// sitting at a waiting prompt still has nothing to recompose, which the flash
+    /// version could not manage - a cursor refreshed forever kept the whole 1024x780
+    /// frame being rebuilt ~58 times a second for one underline.
+    pub cursor: Option<(i32, i32, i32, i32)>,
+
     /// Paint glyphs as a dot matrix this many dots tall, the way a terminal's
     /// character ROM is built, rather than traced strokes.  Zero - the default -
     /// strokes them.  Rows rather than a pitch, so the grid is the same shape
@@ -570,6 +588,7 @@ impl Tube {
             ghost_scale: 0.0,
             ghost_tau: 0.0,
             ghosted_cells: 0,
+            cursor: None,
             light_buf: Vec::new(),
             fresh_buf: Vec::new(),
             bloom_light: Vec::new(),
@@ -1326,6 +1345,7 @@ impl Tube {
                 render_offset,
                 ghost,
                 ghost_scale,
+                cursor,
                 ..
             } = self;
             let (stored, fresh, under) = (&*stored, &*fresh, &*under);
@@ -1334,6 +1354,7 @@ impl Tube {
             // where it was, like the light a raster terminal left behind
             let ghost: &[f32] = if ghost.len() == tw * th { ghost } else { &[] };
             let ghost_scale = *ghost_scale;
+            let cursor_rect = *cursor;
             // a scroll slides: the image is already where it belongs, and the
             // offset shows it displaced down the face until the slide finishes
             let off = *render_offset as i64;
@@ -1365,11 +1386,23 @@ impl Tube {
                                 if !ghost.is_empty() {
                                     light += ghost[i] * gs * ghost_scale;
                                 }
+                                // the cursor: light of its own at the level stored
+                                // ink reaches, so it reads as a mark on the face and
+                                // takes the same halo the rest of the ink does
+                                if let Some((cx0, cx1, cy0, cy1)) = cursor_rect {
+                                    if x as i32 >= cx0
+                                        && x as i32 <= cx1
+                                        && y <= cy1 as i64
+                                        && y >= cy0 as i64
+                                    {
+                                        light += gs;
+                                    }
+                                }
                                 fl += fresh[i] * gf;
                                 count += 1.0;
                             }
                         }
-                        lrow[ox] = light / count.max(1.0);
+                                        lrow[ox] = light / count.max(1.0);
                         frow[ox] = fl / count.max(1.0);
                     }
                 },
@@ -2417,6 +2450,42 @@ mod tests {
         assert!(
             curved < blurred * 0.7,
             "the capture curve takes light away: {curved:.2} against {blurred:.2}"
+        );
+    }
+
+    /// The cursor mark is light the face carries: it shows in the rendered frame where
+    /// it is, without being charge in any population and without making the tube
+    /// *alive* (an idle prompt must stay idle).
+    #[test]
+    fn the_cursor_mark_is_light_on_the_face_only() {
+        let mut t = Tube::new(1024, 780);
+        let t_h = t.h;
+        let mut buf = Vec::new();
+        // the frame is in image orientation: tube y is output row h - 1 - y
+        let green = |buf: &Vec<u32>, x: i32, y: i32| {
+            let row = (t_h - 1 - y) as usize;
+            ((buf[row * 1024 + x as usize] >> 8) & 0xff) as i32
+        };
+        t.render_into(&mut buf, 1, 1);
+        let before = green(&buf, 150, 300);
+        t.cursor = Some((100, 200, 300, 301));
+        t.render_into(&mut buf, 1, 1);
+        let after = green(&buf, 150, 300);
+        assert!(
+            after > before + 20,
+            "the mark has to be light where it is: {before} -> {after} (stored_gain {})",
+            t.phosphor.stored_gain
+        );
+        assert!(
+            !t.transients_alive(),
+            "and it must not make the tube alive, or an idle prompt never rests"
+        );
+        t.erase();
+        t.render_into(&mut buf, 1, 1);
+        assert_eq!(
+            green(&buf, 150, 300),
+            after,
+            "an erase takes the charge, not the display's own mark"
         );
     }
 

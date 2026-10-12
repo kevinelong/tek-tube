@@ -2747,6 +2747,11 @@ mod harness {
     ///                the tube configured again and the page written again - and
     ///                report the ink before and after and whether the session
     ///                answered a command typed after the change (default: none)
+    ///   TEK_CURSOR   sample the cursor's own dots on an idle tube - dimmest,
+    ///                brightest and the blank cell it has to stand out from - which
+    ///                is how a cursor that stays visible is measured (default: no
+    ///                sampling)
+    ///   TEK_CURSOR_SECONDS    how long to sample it for (default 4)
     ///   TEK_WAIT     seconds to run after each command (default 2)
     ///   TEK_SECONDS  seconds to run after the script has been typed (default 6)
     ///   TEK_SIZE     the tube, WxH (default 1280x720)
@@ -2907,6 +2912,67 @@ mod harness {
                 "REFONT session answered after the changes: {}",
                 text.contains(mark)
             );
+        }
+
+        // The cursor is a flash, so it fades: `TEK_CURSOR=1` watches the underline on
+        // an idle tube - the dimmest and brightest reading over the window, a sample
+        // every quarter second or so, and the same reading taken from a blank cell as
+        // the floor the cursor has to be told apart from.  Without the refresh the
+        // dimmest reading is the floor, which is the cursor gone.
+        if std::env::var("TEK_CURSOR").is_ok() {
+            let seconds = env_f32("TEK_CURSOR_SECONDS", 4.0);
+            let cw = (tube.w / term.cols as i32).max(1);
+            let ch = (tube.h / term.rows as i32).max(1);
+            let (cols, rows, page_h) = (term.cols, term.rows, tube.h);
+            let cell_pixel = |c: usize, r: usize| -> (i32, i32) {
+                (
+                    c.min(cols - 1) as i32 * cw + cw / 2,
+                    page_h - ch - r.min(rows - 1) as i32 * ch + 2,
+                )
+            };
+            // the cursor is drawn into the *frame* (it is the display's mark, not
+            // charge), so it is the rendered buffer that has to be read here - the
+            // way the tests that look at strokes do
+            let mut buf: Vec<u32> = Vec::new();
+            let sample = |tube: &mut Tube, buf: &mut Vec<u32>, at: Option<(i32, i32)>| -> Option<i32> {
+                let (x, y) = at?;
+                tube.render_into(buf, 1, 1);
+                // the frame is in image orientation: tube y is output row h - 1 - y
+                let i = ((tube.h - 1 - y) * tube.w + x) as usize;
+                buf.get(i).map(|p| ((p >> 8) & 0xff) as i32)
+            };
+            // a cell the shell has written nothing into, at the same height in the
+            // page: what the flood gun alone reads, which is what the cursor has to be
+            // told apart from
+            let blank = {
+                let empty_row = (0..rows).rev().find(|r| {
+                    (0..cols).all(|c| term.screen.visible_char(c, *r) == ' ')
+                });
+                empty_row.map(|r| cell_pixel(cols / 2, r))
+            };
+            let floor = sample(&mut tube, &mut buf, blank);
+            let until = Instant::now() + std::time::Duration::from_secs_f32(seconds);
+            let mut samples = Vec::new();
+            while Instant::now() < until {
+                frame!();
+                if let Some(g) = sample(&mut tube, &mut buf, Some(cell_pixel(term.screen.cx, term.screen.cy))) {
+                    samples.push(g);
+                }
+            }
+            let dimmest = samples.iter().copied().min().unwrap_or(-1);
+            let brightest = samples.iter().copied().max().unwrap_or(-1);
+            println!(
+                "CURSOR over {seconds:.0}s: {} samples, dimmest {dimmest}, brightest {brightest}, \
+                 blank-cell floor {}, mark {:?} at cell ({}x{}, {}x{})",
+                samples.len(),
+                floor.map(|g| g.to_string()).unwrap_or_else(|| "n/a".into()),
+                tube.cursor,
+                term.screen.cx,
+                term.screen.cy,
+                cols,
+                rows
+            );
+            println!("CURSOR samples: {:?}", &samples[..samples.len().min(20)]);
         }
 
         let seq = std::env::var("TEK_SEQ").ok();

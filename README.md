@@ -224,7 +224,7 @@ of the tube.
 
 ```sh
 cargo build --release          # binary in target/release/tek-tube
-cargo test                     # 117 unit and end-to-end tests (2 ignored)
+cargo test                     # 122 unit and end-to-end tests (2 ignored)
 ```
 
 Play a file in a window (ESC or the close button quits):
@@ -255,7 +255,9 @@ declares per monitor DPI awareness, so a 1024x780 buffer occupies 1024x780
 the window by the monitor's scale factor - on a 150 % display the same buffer is
 bilinearly blown up to 1536x1170 before it is shown - which turns the strokes
 and every speck of phosphor grain into fog.  A settled target is not recomposed
-at all, so an idle screen costs nothing and runs at the display's rate; while a
+at all, so an idle screen costs nothing and runs at the display's rate - the cursor
+is a steady mark *in* the frame rather than a transient that would keep the tube
+alive (see terminal mode below); while a
 file is being drawn, one frame costs about 16 ms at 1024x780 in a release build
 and about 71 ms in the debug one.
 
@@ -411,6 +413,40 @@ field as everything else, so glyphs glow and settle exactly like vectors do.
 `docs/terminal-session.png` is a real session replayed through the renderer,
 `docs/terminal-live.png` is the live window, and `docs/font-compare.png` shows
 the available faces at both sizes.
+
+**The cursor is a steady mark, because a flash cannot be one.**  A storage tube
+stores what the beam writes and the stored charge is permanent, so a cursor is never
+*committed* - and it cannot be a *flash* either.  Drawn transiently it faded to
+nothing within a second of the shell going quiet, and the tube then sat there with no
+cursor at all until the next key: the one thing a terminal must not do.  Writing it
+again on a clock is the other obvious answer and it is the wrong one - a flash that is
+refreshed never lets the tube's aliveness check clear, so a 1024x780 frame would be
+recomposed some 58 times a second, forever, for one underline.  The hardware's own
+hosts wrote a cursor as *stored* ink and redrew the page to move it, which is a steady
+mark, and that is what this is:
+
+* drawn at the level stored ink reaches, so it reads as ink on the face and takes the
+  same halo the rest of the ink does;
+* not charge in any population, so erasing the target does not blink it and moving it
+  leaves no trail of itself;
+* and not a *transient*, so it does not make the tube alive: an idle prompt still stops
+  recomposing when the trail has decayed, and what stays on the screen is the frame the
+  cursor is already in.
+
+Measured through the harness on an idle tube (`TEK_CURSOR=1`, a cold start with no
+script typed, the rendered frame's green channel sampled ~1400 times over 6 s, against
+a blank cell at the same height as the floor the flood gun sets):
+
+| cursor | dimmest | brightest | blank cell |
+|---|---|---|---|
+| this | **188** | 188 | 76 |
+| before (a transient, never rewritten - `v0.3.1`) | **77** | 206 | 76 |
+
+The old cursor fell to the floor within a second and stayed there, which is the "cursor
+fades away completely" this answers; the new one does not move at all.  It costs
+nothing: a 25 s idle session draws 797 frames against 873 for the transient version,
+both stopping once the trail's own light has decayed, and the mark is simply part of
+whatever frame is drawn next.
 
 **The font is a stroke font, because it has to be.**  A storage tube stores
 whatever the beam traces, and the 4010 stroked its characters rather than

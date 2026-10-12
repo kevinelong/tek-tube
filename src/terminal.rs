@@ -1282,7 +1282,7 @@ impl Terminal {
                 // as one letter while a scroll moves the page
                 self.pen
                     .advance(rate * dt, &self.screen, tube, self.cols, self.rows);
-                draw_cursor(&self.screen, self.cols, self.rows, tube, Write::Flash);
+                set_cursor(&self.screen, self.cols, self.rows, tube);
             }
             None => {
                 self.stroke_changed(tube, Write::Flash, true);
@@ -1436,7 +1436,7 @@ pub fn stroke_screen(
         }
     }
     if cursor {
-        draw_cursor(screen, cols, rows, tube, write);
+        set_cursor(screen, cols, rows, tube);
     }
 }
 
@@ -1529,34 +1529,28 @@ pub fn stroke_changed(
         }
     }
     if cursor {
-        draw_cursor(screen, cols, rows, tube, write);
+        set_cursor(screen, cols, rows, tube);
     }
 }
 
-/// The cursor: an underline, drawn transiently.  On a storage tube the cursor
-/// *is* the beam position, so it is never committed.
-pub fn draw_cursor(screen: &vt::Screen, cols: usize, rows: usize, tube: &mut Tube, write: Write) {
+/// The cursor: an underline, drawn by the display rather than charged into the tube.
+///
+/// On a storage tube the cursor *is* the beam position, so it is never committed -
+/// and it cannot be a flash either, or it fades away within a second and the tube is
+/// left with no cursor at all.  It is a steady mark at stored-ink level, which is
+/// what the hardware's own hosts produced when they wrote a cursor and redrew the
+/// page to move it (see `Tube::cursor`).
+pub fn set_cursor(screen: &vt::Screen, cols: usize, rows: usize, tube: &mut Tube) {
     if !screen.cursor_visible {
+        tube.cursor = None;
         return;
     }
     let cw = (tube.w / cols as i32).max(1);
     let ch = (tube.h / rows as i32).max(1);
-    let st = Style {
-        line: LineStyle::Solid,
-        defocus: false,
-        write,
-    };
     let cx = screen.cx.min(cols - 1);
     let cy = screen.cy.min(rows - 1);
     let y = tube.h - ch - (cy as f32 * ch as f32).round() as i32;
-    tube.line(
-        cx as i32 * cw + 2,
-        y + 2,
-        cx as i32 * cw + cw - 2,
-        y + 2,
-        st,
-        1.0,
-    );
+    tube.cursor = Some((cx as i32 * cw + 2, cx as i32 * cw + cw - 2, y + 2, y + 3));
 }
 
 /// The panel key a window key names, if it is one the options panel uses.
@@ -2550,6 +2544,77 @@ mod tests {
             mid_lit < top_lit,
             "the middle should be darker than the text row: {mid_lit} vs {top_lit}"
         );
+    }
+
+    /// The cursor is a *steady* mark: it is light the display draws, not charge and
+    /// not a flash, so it neither fades away (which is what the tube had, and what a
+    /// terminal must not) nor has to be written again forever (which would keep an
+    /// idle 1024x780 tube recomposing every frame).  The numbers are differences
+    /// rather than absolutes because the flood gun lights the whole target.
+    #[test]
+    fn the_cursor_is_a_steady_mark_that_does_not_fade() {
+        let mut tube = Tube::new(1024, 780);
+        let mut screen = vt::Screen::new(74, 35);
+        screen.cx = 4;
+        screen.cy = 2;
+        screen.cursor_visible = true;
+        let (cols, rows) = (74usize, 35usize);
+        set_cursor(&screen, cols, rows, &mut tube);
+        let (x, y) = tube.cursor.map(|(x0, x1, y, _)| ((x0 + x1) / 2, y)).unwrap();
+        let mut buf = Vec::new();
+        // the frame is in image orientation: tube y is output row h - 1 - y
+        let green = |tube: &mut Tube, buf: &mut Vec<u32>| {
+            tube.render_into(buf, 1, 1);
+            let row = (tube.h - 1 - y) as usize;
+            ((buf[row * tube.w as usize + x as usize] >> 8) & 0xff) as i32
+        };
+
+        let first = green(&mut tube, &mut buf);
+        // the mark has to be *light*: compare it with a dot the page has nothing on
+        let blank = {
+            let (bx, by) = (x, y + 40);
+            tube.render_into(&mut buf, 1, 1);
+            ((buf[(by * tube.w + bx) as usize] >> 8) & 0xff) as i32
+        };
+        assert!(
+            first - blank >= 40,
+            "the cursor has to be lit, not just present: {first} against a blank {blank}"
+        );
+        // a minute of the tube's own decay, pumped the way the loop pumps it
+        for _ in 0..600 {
+            tube.decay(0.1);
+        }
+        let later = green(&mut tube, &mut buf);
+        assert_eq!(
+            first, later,
+            "the cursor does not fade: {first} then {later} after a minute of decay"
+        );
+
+        // and it is light, not charge: the tube is not *alive* for it (an idle
+        // prompt must stay idle) and erasing the target leaves it alone
+        assert!(
+            !tube.transients_alive(),
+            "a steady mark is not a transient, or the idle tube never rests"
+        );
+        tube.clear_stored();
+        let after_erase = green(&mut tube, &mut buf);
+        assert_eq!(
+            after_erase, first,
+            "the cursor is the display's, not charge in the image: {first} -> {after_erase}"
+        );
+    }
+
+    /// Hiding the cursor takes the mark off the face, and it stays off.
+    #[test]
+    fn a_hidden_cursor_leaves_nothing_behind() {
+        let mut tube = Tube::new(1024, 780);
+        let mut screen = vt::Screen::new(74, 35);
+        screen.cursor_visible = true;
+        set_cursor(&screen, 74, 35, &mut tube);
+        assert!(tube.cursor.is_some(), "a visible cursor is a mark on the face");
+        screen.cursor_visible = false;
+        set_cursor(&screen, 74, 35, &mut tube);
+        assert!(tube.cursor.is_none(), "and a hidden one is not");
     }
 
     /// The shell commands come from the setup's `shells.txt`, and the shells
