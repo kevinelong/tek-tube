@@ -309,6 +309,67 @@ In terminal mode the type advertised to the shell (and so to anything it ssh's t
 is vt100, forced rather than inherited; TEK_TUBE_TERM overrides it.
 ";
 
+/// How many processes are attached to this program's console: 0 when there is none.
+///
+/// Windows gives a *console* program a console of its own when it is started without one -
+/// from the Start Menu, a shortcut, or Explorer - and that console is a black window beside
+/// the tube.  It is not the shell's window: the shell runs under a pseudoconsole, which has
+/// no window at all, and the only thing this console ever shows is the program's own session
+/// report.  One entry means the console exists for us and nobody else.
+#[cfg(windows)]
+fn console_processes() -> u32 {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
+    }
+    let mut pids = [0u32; 4];
+    // SAFETY: the array is ours and the count is its length; the call writes at most that
+    // many entries and touches nothing else.
+    unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) }
+}
+
+/// Take the console window *we* were given off the screen, and return whether there was one.
+///
+/// The executable stays built for the console subsystem on purpose.  A program built for the
+/// *windows* subsystem is not attached to the console it was started from, so its output
+/// would go nowhere and, worse, `tek-tube --png out.png` from a script would return before the
+/// file was written - the shell does not wait for a windowed program.  So a console that a
+/// *shell* provided is left exactly as it is, and only the one Windows invents for a
+/// windowless start is hidden.
+///
+/// Hidden rather than freed: `FreeConsole` would destroy the window outright, but it also
+/// invalidates the standard handles, and then the report the program prints on its way out
+/// would fail rather than going quietly to a console nobody can see.
+#[cfg(windows)]
+fn hide_owned_console() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleWindow() -> isize;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+    }
+    /// `SW_HIDE`
+    const SW_HIDE: i32 = 0;
+    if console_processes() != 1 {
+        return false;
+    }
+    let hwnd = unsafe { GetConsoleWindow() };
+    if hwnd == 0 {
+        return false;
+    }
+    unsafe {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn hide_owned_console() -> bool {
+    false
+}
+
 /// A process that does not declare DPI awareness gets its window bitmap
 /// stretched by the monitor's scale factor before anyone sees it: on a 200 %
 /// display a 1024x780 buffer is blown up to 2048x1560 by the compositor, which
@@ -370,6 +431,9 @@ fn fit_shrink(tw: i32, th: i32, screen: (usize, usize)) -> i32 {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // first, before anything else can print: a console window of ours is not part of this
+    // program's idea of itself (see `hide_owned_console`)
+    let _ = hide_owned_console();
     be_dpi_aware();
     let opts = match parse_args()? {
         Some(o) => o,
@@ -3320,6 +3384,22 @@ mod tests {
         for name in ["device", "zoom", "shrink"] {
             let row = plot.iter().find(|r| r.name == name).expect(name);
             assert!(row.launch, "{name} is fixed when the process starts");
+        }
+    }
+
+    /// A console window is hidden only when it is *ours*.  Run from a shell - which is how
+    /// the session report is read, and how a `--png` run is waited for - the console belongs
+    /// to the shell that started us, and it stays exactly where it is.
+    #[test]
+    #[cfg(windows)]
+    fn a_console_shared_with_a_shell_is_left_alone() {
+        // `cargo test` runs with the console of whatever started it, so this process shares
+        // one and the hide has to decline.
+        if console_processes() > 1 {
+            assert!(
+                !hide_owned_console(),
+                "a console shared with the shell that started us must be left alone"
+            );
         }
     }
 

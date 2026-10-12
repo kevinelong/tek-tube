@@ -828,6 +828,17 @@ back to Windows PowerShell and then `cmd.exe`.  A command line in it is quoted t
 Windows quotes one, which is what makes the Git Bash entry above work at all: the program
 lives under `Program Files`.
 
+**Started that way it used to put a second black window on the screen**, and the reason is
+worth writing down: the executable is built for the Windows *console* subsystem - it has to
+be, or a shell that starts `tek-tube --png out.png` would not wait for the file to be written
+and its report would go nowhere - and Windows gives a console program a console of its own
+when it is started without one.  That window is the program's, not the shell's: the shell
+runs under a pseudoconsole and has no window at all, and the only thing the console ever
+showed was the session report.  The program now hides a console that is *its own* and leaves
+one alone that a shell provided, which `GetConsoleProcessList` distinguishes by returning one
+entry.  So: launched from the Start Menu there is no console window, and launched from a shell
+the report still appears in that shell's terminal, where it was asked for.
+
 ## Targets
 
 | device | addressable | visible | notes |
