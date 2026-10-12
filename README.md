@@ -290,10 +290,14 @@ has *settled*, a quarter of a second after the last change: a fullscreen frame i
 picture with one number different.  Only two rows need the page *written* again
 rather than recomposed - the cell size and the face - and the terminal does that by
 clearing its record and writing the page in the new rules.  Neither ends anything:
-a face change costs a page, not a session.  A click on a slider jumps the value
-there and starts a drag; the wheel nudges the row under the pointer.  The panel is
-drawn over the frame that is already there, so it stays with the mouse while the
-costly half waits.
+a face change costs a page, not a session.  A click steps a list **once**, however
+long the button is held, and flips a box once with it: the window hands the panel the
+button's *state* every frame, so a press is taken from its **edge** - a real click
+lasts several frames, and acting on the state walked a list six entries, which read
+as a random choice rather than the next one.  Only a slider follows the button while
+it is down, which is what a drag is.  The wheel nudges the row under the pointer.
+The panel is drawn over the frame that is already there, so it stays with the mouse
+while the costly half waits.
 
 Rows are sliders, boxes that toggle, lists that step, and **presets**: `wyse` and
 `tek` as bundles of rows, showing `custom` when the machine matches neither.

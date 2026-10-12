@@ -115,6 +115,10 @@ pub struct Panel {
     pub rows: Vec<Row>,
     /// The row being dragged, if any.
     dragging: Option<usize>,
+    /// Whether the button was down on the previous frame, so a discrete control can
+    /// act on the *edge*.  `handle` is handed the frame's button state, not an
+    /// event, so acting on the state itself made a held button a press per frame.
+    down_last: bool,
     /// Which row the keyboard is on, and the row the drawing marks.  It starts at
     /// the top whenever the panel is opened.
     selected: usize,
@@ -138,6 +142,7 @@ impl Panel {
             open: false,
             rows,
             dragging: None,
+            down_last: false,
             selected: 0,
             changed_at: None,
             last_changed: None,
@@ -399,6 +404,15 @@ impl Panel {
     /// whatever row is under the pointer.  What each hit *means* is `press`, which
     /// the keyboard also runs.
     pub fn handle(&mut self, w: usize, h: usize, pos: (f32, f32), down: bool, wheel: f32) -> bool {
+        // A held button is *one* press.  This is called once a frame with the
+        // button's state rather than with an event, so a discrete control that acted
+        // on the state itself moved once per frame the button was down - and a real
+        // click lasts several frames, so one click walked a list six entries and the
+        // choice looked random rather than the next one.  A slider is the one control
+        // that wants the state, because following the pointer while it is down is the
+        // whole point of a drag.
+        let pressed = down && !self.down_last;
+        self.down_last = down;
         if !self.open {
             self.dragging = None;
             return false;
@@ -427,7 +441,10 @@ impl Panel {
                     }
                 }
                 Kind::Toggle => {
-                    if down && px >= cx as f32 && px <= (cx + m.cell_h) as f32 {
+                    // a box flips on a press, and a press is the edge: held down,
+                    // the level would flip it every frame and the release would
+                    // decide by parity of the frame count
+                    if pressed && px >= cx as f32 && px <= (cx + m.cell_h) as f32 {
                         Some(Act::Click(px))
                     } else {
                         None
@@ -435,8 +452,9 @@ impl Panel {
                 }
                 Kind::Choice(_) => {
                     // the list's control is as wide as a slider's track, so the hit
-                    // test and the drawing are the same rectangle
-                    if down && px >= t0 && px <= t1 {
+                    // test and the drawing are the same rectangle - and one press is
+                    // one step, however long the button is held
+                    if pressed && px >= t0 && px <= t1 {
                         Some(Act::Click(px))
                     } else if wheel.abs() > 0.0 && px >= cx as f32 {
                         Some(Act::Wheel(wheel))
@@ -735,6 +753,9 @@ mod tests {
         assert!(p.needs_rebuild, "the cell size is structural");
         // the flag is a latch that the caller clears after the rebuild
         p.needs_rebuild = false;
+        // the button comes up before the next press: a press is the edge, so two
+        // frames with the button down are one press and not two
+        assert!(!p.handle(W, H, ((cx + 5) as f32, (ry1 + 4) as f32), false, 0.0));
         let (_, ry2) = p.row_y(W, H, 2);
         assert!(p.handle(W, H, ((cx + 5) as f32, (ry2 + 4) as f32), true, 0.0));
         assert_eq!(p.rows[2].value, 0.0, "the toggle flipped off");
@@ -824,6 +845,57 @@ mod tests {
             p.settle_due(Instant::now() + Duration::from_millis(400)),
             Some((0, true)),
             "a click is a press"
+        );
+    }
+
+    /// A held button is **one** press.  The window hands in the button's *state*
+    /// every frame rather than an event, so a discrete control acting on the state
+    /// moved once per frame - and a real click lasts several frames, so one click
+    /// walked a list several entries, which reads as a random choice instead of the
+    /// next one.  The release is what arms the next press.
+    #[test]
+    fn a_held_button_steps_a_list_once() {
+        let mut p = choice_panel();
+        p.open = true;
+        let cx = p.control_x(H);
+        let (_, ry) = p.row_y(W, H, 0);
+        let at = ((cx + 5) as f32, (ry + 4) as f32);
+        assert!(p.handle(W, H, at, true, 0.0), "the press steps it once");
+        assert_eq!(p.rows[0].shown(), "gothic");
+        for _ in 0..8 {
+            assert!(
+                !p.handle(W, H, at, true, 0.0),
+                "a held button changes nothing more"
+            );
+        }
+        assert_eq!(
+            p.rows[0].shown(),
+            "gothic",
+            "one step for the press, not one per frame"
+        );
+        assert!(!p.handle(W, H, at, false, 0.0), "the release is not a press");
+        assert!(p.handle(W, H, at, true, 0.0));
+        assert_eq!(p.rows[0].shown(), "simplex", "and the next press steps again");
+    }
+
+    /// The same for a box that toggles: one flip per press.  Acting on the state
+    /// flipped it on every frame the button was down, so the release decided it by
+    /// the parity of how long the click took.
+    #[test]
+    fn a_held_button_flips_a_box_once() {
+        let mut p = panel();
+        p.open = true;
+        let cx = p.control_x(H);
+        let (_, ry) = p.row_y(W, H, 2);
+        let at = ((cx + 2) as f32, (ry + 4) as f32);
+        assert!(p.handle(W, H, at, true, 0.0));
+        assert_eq!(p.rows[2].value, 0.0, "the box flipped off");
+        for _ in 0..8 {
+            p.handle(W, H, at, true, 0.0);
+        }
+        assert_eq!(
+            p.rows[2].value, 0.0,
+            "and holding it down does not flip it back"
         );
     }
 
