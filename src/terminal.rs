@@ -719,6 +719,54 @@ pub struct Terminal {
     pending: Vec<u8>,
 }
 
+/// Split a command line into the program and its arguments, the way a Windows
+/// command line is quoted.
+///
+/// Whitespace separates, and `"` groups: `"C:\Program Files\Git\bin\bash.exe" -l`
+/// is one program and one argument, which is the whole reason this is not
+/// `split_whitespace` - the shells the setup offers are installed under
+/// `Program Files`, and the same is true of a WSL path with a space in it.  A
+/// doubled quote inside a quoted run is a literal quote (`"say ""hi"""`), and a
+/// token may be part quoted (`--flag="a b"`), both of which is what
+/// `CommandLineToArgvW` does with the same text.  Backslashes are left alone:
+/// this is not the full VC++ rule set, because the command is the setup's own
+/// text and a quote after a backslash is a path far more often than an escape.
+/// An unclosed quote takes the rest of the line, rather than refusing to start.
+fn split_command(command: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                // "" inside a quoted run: one literal quote
+                chars.next();
+                cur.push('"');
+            }
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if started {
+                    args.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        args.push(cur);
+    }
+    args
+}
+
 impl Terminal {
     pub fn spawn(
         command: &str,
@@ -732,12 +780,10 @@ impl Terminal {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        // split the command line on whitespace; enough for a shell and its
-        // arguments and avoids pulling in a shell-quoting crate
-        let mut parts = command.split_whitespace();
-        let program = parts.next().ok_or("empty shell command")?;
+        let args = split_command(command);
+        let program = args.first().ok_or("empty shell command")?;
         let mut cmd = CommandBuilder::new(program);
-        for arg in parts {
+        for arg in &args[1..] {
             cmd.arg(arg);
         }
         // Say what kind of terminal this is.  The value is *forced*, not
@@ -2485,5 +2531,35 @@ mod tests {
             mid_lit < top_lit,
             "the middle should be darker than the text row: {mid_lit} vs {top_lit}"
         );
+    }
+
+    /// The shell commands come from the setup's `shells.txt`, and the shells
+    /// worth offering sit under `Program Files`, so the quoting has to survive a
+    /// path with a space in it.
+    #[test]
+    fn a_command_line_splits_on_quotes_not_only_on_spaces() {
+        let split = |s: &str| split_command(s);
+        assert_eq!(split("powershell.exe"), vec!["powershell.exe"]);
+        assert_eq!(
+            split("pwsh.exe -NoLogo -NoProfile"),
+            vec!["pwsh.exe", "-NoLogo", "-NoProfile"]
+        );
+        assert_eq!(
+            split(r#""C:\Program Files\Git\bin\bash.exe" --login -i"#),
+            vec![r"C:\Program Files\Git\bin\bash.exe", "--login", "-i"]
+        );
+        assert_eq!(
+            split(r#""C:\Program Files\Git\bin\bash.exe""#),
+            vec![r"C:\Program Files\Git\bin\bash.exe"]
+        );
+        assert_eq!(split("wsl.exe -d Ubuntu"), vec!["wsl.exe", "-d", "Ubuntu"]);
+        // a token can be part quoted, and a doubled quote is a literal one
+        assert_eq!(split(r#"--flag="a b" c"#), vec!["--flag=a b", "c"]);
+        assert_eq!(split(r#"say "say ""hi""""#), vec!["say", r#"say "hi""#]);
+        // an empty quoted argument is an argument, and an unclosed quote takes
+        // the rest of the line rather than dropping it
+        assert_eq!(split(r#"a "" b"#), vec!["a", "", "b"]);
+        assert_eq!(split(r#"a "b c"#), vec!["a", "b c"]);
+        assert_eq!(split("   "), Vec::<String>::new());
     }
 }

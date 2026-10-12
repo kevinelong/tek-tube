@@ -224,7 +224,7 @@ of the tube.
 
 ```sh
 cargo build --release          # binary in target/release/tek-tube
-cargo test                     # 112 unit and end-to-end tests (2 ignored)
+cargo test                     # 114 unit and end-to-end tests (2 ignored)
 ```
 
 Play a file in a window (ESC or the close button quits):
@@ -722,6 +722,43 @@ tek-tube samples/isco10.plt --png out.png --stats --dump-chars --probe 1600,1500
   settled stored stroke
 
 Full option list: `tek-tube --help`.
+
+### The Windows setup
+
+`tools/setup.cmd` installs the Windows build without an administrator: it copies
+`tek-tube.exe` into `%LOCALAPPDATA%\Programs\tek-tube`, asks which shells the Start Menu
+should offer - the ones Windows Terminal would list on the same machine: Windows
+PowerShell, PowerShell, Command Prompt, Git Bash, and one entry per WSL distribution - and
+writes the answer to `%APPDATA%\tek-tube\shells.txt`.  It then creates a **tek terminal**
+entry for the default shell and one entry per shell, and an `uninstall.cmd` that removes
+them again.
+
+```sh
+tools\setup.cmd                                        # ask
+tools\setup.cmd -List                                  # what is on this machine
+tools\setup.cmd -Shells "Windows PowerShell","Git Bash" -Default "Git Bash"
+tools\setup.cmd -InstallDir C:\tools\tek-tube -NoShortcuts   # install, no Start Menu
+tools\uninstall.cmd                                    # remove (-Purge: the settings too)
+```
+
+An entry passes a shell **name**, not a command line: `tek terminal (Git Bash)` runs
+`tek-tube.exe --shell "Git Bash"`, and the plain `tek terminal` passes no `--shell` at all,
+so it follows the `default` line in that file.  Which shell an entry runs, and what command
+a name means, is therefore an edit to `shells.txt` - and `--list-shells` prints what is
+configured:
+
+```sh
+tek-tube.exe --list-shells
+C:\Users\kevin\AppData\Roaming\tek-tube\shells.txt
+* Windows PowerShell = C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+  Git Bash = "C:\Program Files\Git\bin\bash.exe" --login -i
+```
+
+The file is read by the program, not only by the setup: a `tek-tube.exe` with no arguments
+- a shortcut, a double click, the taskbar - runs the shell `default` names, before falling
+back to Windows PowerShell and then `cmd.exe`.  A command line in it is quoted the way
+Windows quotes one, which is what makes the Git Bash entry above work at all: the program
+lives under `Program Files`.
 
 ## Targets
 

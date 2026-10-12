@@ -66,6 +66,10 @@ struct Options {
     windowed: bool,
     /// Run a shell under a pseudoconsole instead of playing plot files.
     shell: Option<String>,
+    /// Print the shells the setup configured (`shells.txt`) and exit.
+    list_shells: bool,
+    /// Print the version and exit.
+    version: bool,
     /// Terminal mode: how long the transient image lingers, in seconds.  This
     /// is the length of the smear; 0 makes it a plain storage tube.
     trail: Option<f32>,
@@ -136,6 +140,8 @@ impl Default for Options {
             threads: None,
             windowed: false,
             shell: None,
+            list_shells: false,
+            version: false,
             trail: None,
             vt_replay: None,
             write_rate: None,
@@ -272,9 +278,16 @@ Usage: tek-tube [options] file.plt [more.plt ...]
                             calibrated through a different scene
   --shell CMD               run a shell under a pseudoconsole and render the
                             session on the tube instead of playing plot files,
-                            e.g. --shell powershell.exe.  The page is the
+                            e.g. --shell powershell.exe.  CMD may also be the
+                            *name* of a shell the Windows setup offered
+                            (shells.txt), which is what the Start Menu entries
+                            pass, e.g. --shell \"Git Bash\"; a command line is
+                            quoted the way Windows quotes it, so a program under
+                            \"Program Files\" keeps its quotes.  The page is the
                             tube's own 74x35.  Ctrl+Shift+Q quits, or exit the
                             shell; ESC goes to the shell as ESC
+  --list-shells             print the shells the setup configured, and which of
+                            them a bare tek-tube.exe runs
   --fullscreen start fullscreen with no title bar, the whole screen given to
                             the tube (this is the default; F11 toggles).  In
                             terminal mode the tube is the screen, so the cell
@@ -285,8 +298,12 @@ Usage: tek-tube [options] file.plt [more.plt ...]
   --threads N               threads a render pass may use (default: the machine's
                             own count, capped at 8; 1 makes the render serial)
   -h, --help this text
+  --version print the version and exit
 
 Without --png/--png-seq a window opens (ESC quits).
+
+With no file and no --shell the tube runs a terminal on the setup's default shell
+(shells.txt), or on the platform's own shell when that file is not there.
 
 In terminal mode the type advertised to the shell (and so to anything it ssh's to)
 is vt100, forced rather than inherited; TEK_TUBE_TERM overrides it.
@@ -361,16 +378,144 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Ok(());
         }
     };
+    if opts.version {
+        // The version the binary was built from, not a file's metadata: this is
+        // what the Windows setup reports and what a bug report wants.
+        println!("tek-tube {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if opts.list_shells {
+        list_shells();
+        return Ok(());
+    }
     run(opts)
 }
 
-/// The shell to run when the command line names nothing: the platform's own.
+/// One shell the setup offered: the name it is listed and referred to by, and the
+/// command line that starts it.
+#[derive(PartialEq, Debug)]
+struct ShellProfile {
+    name: String,
+    command: String,
+}
+
+/// The shells `tools/setup.ps1` wrote into `shells.txt`, and which of them a bare
+/// `tek-tube.exe` runs.
 ///
-/// An absolute path, because a bare `powershell.exe` does not resolve when the
-/// program is launched from Explorer or a shortcut - which is exactly when there
-/// are no arguments to go on.  Nothing found means no default, and the usage is
-/// printed the way it always was.
+/// The file is the installer's own text:
+///
+/// ```text
+/// # tek-tube shells: one per line, `name = command line`
+/// default = Windows PowerShell
+/// Windows PowerShell = C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+/// Git Bash = "C:\Program Files\Git\bin\bash.exe" --login -i
+/// WSL (Ubuntu) = wsl.exe -d Ubuntu
+/// ```
+///
+/// Every line is `name = command line`, split on the *first* `=` so a command may
+/// contain one, and `#` starts a comment.  Names are matched without case, so what
+/// the setup capitalised is nothing a Start Menu entry or a typed `--shell bash`
+/// has to know.  Anything unreadable is dropped rather than reported: a shell
+/// profile is a convenience, and none of them is worth refusing to start over.
+#[derive(Default, PartialEq, Debug)]
+struct Shells {
+    profiles: Vec<ShellProfile>,
+    default: Option<String>,
+}
+
+impl Shells {
+    fn parse(text: &str) -> Shells {
+        let mut shells = Shells::default();
+        for line in text.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((name, command)) = line.split_once('=') else {
+                continue;
+            };
+            let (name, command) = (name.trim(), command.trim());
+            if name.is_empty() || command.is_empty() {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("default") {
+                shells.default = Some(command.to_string());
+            } else {
+                shells.profiles.push(ShellProfile {
+                    name: name.to_string(),
+                    command: command.to_string(),
+                });
+            }
+        }
+        shells
+    }
+
+    /// The configured profiles, or none at all: a missing or unreadable file
+    /// leaves the platform's own shell as the default, which is what the program
+    /// did before this file existed.
+    fn load() -> Shells {
+        shells_path()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .map(|text| Shells::parse(&text))
+            .unwrap_or_default()
+    }
+
+    /// The command line a name starts, or `None` if no profile goes by that name.
+    fn command_for(&self, name: &str) -> Option<&str> {
+        self.profiles
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+            .map(|p| p.command.as_str())
+    }
+
+    /// What a bare `tek-tube.exe` runs: the shell the file names as `default`, else
+    /// the first one it lists, else nothing - and then `default_shell` falls back
+    /// to what the platform has.
+    fn default_command(&self) -> Option<&str> {
+        self.default
+            .as_deref()
+            .and_then(|name| self.command_for(name))
+            .or_else(|| self.profiles.first().map(|p| p.command.as_str()))
+    }
+}
+
+/// `--list-shells`: what the setup configured, and which of them a bare
+/// `tek-tube.exe` runs - so "why does that Start Menu entry run *that*" is one
+/// command, not a hunt through `%APPDATA%`.
+fn list_shells() {
+    let shells = Shells::load();
+    let Some(path) = shells_path() else {
+        println!("no config directory: no shells configured");
+        return;
+    };
+    println!("{}", path.display());
+    if shells.profiles.is_empty() {
+        println!("no shells configured: a bare tek-tube.exe runs the platform's own");
+        return;
+    }
+    let default = shells.default_command();
+    for p in &shells.profiles {
+        let mark = if Some(p.command.as_str()) == default {
+            "*"
+        } else {
+            " "
+        };
+        println!("{mark} {} = {}", p.name, p.command);
+    }
+}
+
+/// The shell to run when the command line names nothing: the setup's choice, or
+/// the platform's own.
+///
+/// `shells.txt` comes first because it is what the Start Menu entries run and what
+/// the user's own edit of that file expresses.  After that, an absolute path,
+/// because a bare `powershell.exe` does not resolve when the program is launched
+/// from Explorer or a shortcut - which is exactly when there are no arguments to
+/// go on.  Nothing found means no default, and the usage is printed the way it
+/// always was.
 fn default_shell() -> Option<String> {
+    if let Some(command) = Shells::load().default_command() {
+        return Some(command.to_string());
+    }
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     for candidate in [
         format!("{root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
@@ -979,34 +1124,40 @@ impl Presets {
     }
 }
 
-/// Where the user's saved presets live.
+/// Where the user's own settings live: `%APPDATA%\tek-tube` on Windows and
+/// `$XDG_CONFIG_HOME/tek-tube` (falling back to `~/.config/tek-tube`) elsewhere.
 ///
-/// A preset belongs to the user, not to the repository and not to whatever
-/// directory the program happened to be started in, so it goes in the platform's
-/// per-user config directory: `%APPDATA%\tek-tube\presets.txt` on Windows and
-/// `$XDG_CONFIG_HOME/tek-tube/presets.txt` (falling back to
-/// `~/.config/tek-tube/presets.txt`) elsewhere.  `None` when the environment names
-/// no such directory: presets then simply are not persisted, and the panel offers
-/// the built-ins as it always did.
-fn presets_path() -> Option<PathBuf> {
+/// A preset or a shell profile belongs to the user, not to the repository and not
+/// to whatever directory the program happened to be started in.  `None` when the
+/// environment names no such directory: nothing user-owned is then read or
+/// written, the panel offers the built-in presets as it always did, and a bare
+/// `tek-tube.exe` runs the platform's own shell.
+fn config_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         std::env::var_os("APPDATA")
             .map(PathBuf::from)
-            .map(|p| p.join("tek-tube").join("presets.txt"))
+            .map(|p| p.join("tek-tube"))
     }
     #[cfg(not(windows))]
     {
         if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
-            return Some(PathBuf::from(dir).join("tek-tube").join("presets.txt"));
+            return Some(PathBuf::from(dir).join("tek-tube"));
         }
-        std::env::var_os("HOME").map(|h| {
-            PathBuf::from(h)
-                .join(".config")
-                .join("tek-tube")
-                .join("presets.txt")
-        })
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("tek-tube"))
     }
+}
+
+/// The user's saved panel presets: `presets.txt` in the config directory.
+fn presets_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("presets.txt"))
+}
+
+/// The shells the Windows setup offered: `shells.txt` in the same directory,
+/// written by `tools/setup.ps1` and read here, so a Start Menu entry can pass a
+/// name and changing which shell it runs is an edit to one text file.
+fn shells_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("shells.txt"))
 }
 
 /// Read the user's presets.  A missing file, or one that has been corrupted, is
@@ -2770,7 +2921,18 @@ where
             "--fullscreen" => o.windowed = false,
             "--windowed" => o.windowed = true,
             "--threads" => o.threads = Some(value("--threads")?.parse()?),
-            "--shell" => o.shell = Some(value("--shell")?),
+            // A name from shells.txt is resolved here rather than where the shell
+            // is spawned, so every path that starts one - the command line, a
+            // Start Menu entry, a panel relaunch - agrees on what
+            // `--shell "Git Bash"` means; a command line that names a program is
+            // passed through exactly as it was.
+            "--shell" => {
+                let given = value("--shell")?;
+                let shells = Shells::load();
+                o.shell = Some(shells.command_for(&given).unwrap_or(&given).to_string());
+            }
+            "--list-shells" => o.list_shells = true,
+            "--version" | "-V" => o.version = true,
             "--trail" => o.trail = Some(value("--trail")?.parse()?),
             "--vt-replay" => o.vt_replay = Some(PathBuf::from(value("--vt-replay")?)),
             "--write-rate" => o.write_rate = Some(value("--write-rate")?.parse()?),
@@ -3313,5 +3475,59 @@ mod tests {
         assert_eq!(round.len(), presets.len());
         assert_eq!(round[0].name, presets[0].name);
         assert_eq!(round[0].rows, presets[0].rows);
+    }
+
+    /// The setup writes `shells.txt` and the Start Menu entries name what it
+    /// wrote, so the parse has to agree with `setup.ps1` exactly: split on the
+    /// first `=`, names matched without case, and a `default` that falls back to
+    /// the first profile rather than to nothing.
+    #[test]
+    fn shell_profiles_parse_the_way_the_setup_writes_them() {
+        let text = "\
+# tek-tube shells: one per line, `name = command line`
+default = Git Bash
+
+Windows PowerShell = C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe
+Git Bash = \"C:\\Program Files\\Git\\bin\\bash.exe\" --login -i
+WSL (Ubuntu) = wsl.exe -d Ubuntu
+odd = cmd.exe /c echo a=b
+";
+        let shells = Shells::parse(text);
+        assert_eq!(
+            shells.profiles.len(),
+            4,
+            "a comment and a blank line are not profiles"
+        );
+        assert_eq!(
+            shells.command_for("git bash"),
+            Some("\"C:\\Program Files\\Git\\bin\\bash.exe\" --login -i"),
+            "a name resolves whatever its case, and the command keeps its text"
+        );
+        assert_eq!(shells.command_for("not a shell"), None);
+        assert_eq!(
+            shells.default_command(),
+            shells.command_for("Git Bash"),
+            "`default` names a profile, and that is what a bare tek-tube.exe runs"
+        );
+        assert_eq!(
+            shells.command_for("odd"),
+            Some("cmd.exe /c echo a=b"),
+            "only the first `=` separates, so a command may contain one"
+        );
+
+        // No `default` line is the first profile; a `default` naming nothing
+        // falls through to it too, rather than leaving no shell at all.
+        assert_eq!(
+            Shells::parse("a = one.exe\nb = two.exe\n").default_command(),
+            Some("one.exe")
+        );
+        assert_eq!(
+            Shells::parse("default = gone\na = one.exe\n").default_command(),
+            Some("one.exe")
+        );
+        // Nothing configured - no file, an empty file - is no choice at all, and
+        // the platform's own shell is used.
+        assert_eq!(Shells::default().default_command(), None);
+        assert!(Shells::parse("").profiles.is_empty());
     }
 }
