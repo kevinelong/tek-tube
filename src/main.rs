@@ -976,12 +976,20 @@ fn toggle(name: &'static str, value: f32, structural: bool) -> panel::Row {
     }
 }
 
-/// A chooser: a row whose value is an index into a list of names.
+/// A chooser: a row whose value is an index into a list of names, honoured as soon
+/// as the change settles.
 ///
-/// The preset row is the only one the panel offers.  A preset is not a value of
-/// its own - it is the *state* the other rows are in - so the index here is
-/// derived from them (see `preset_index`) rather than remembered, and only the
-/// press applies anything.
+/// Two of the panel's choosers are built here, and they are not the same kind of
+/// thing.  `preset` is a *view*: a preset is not a value of its own but the state
+/// the other rows are in, so its index is derived from them (`preset_index`) rather
+/// than remembered - which is why a **step** through it applies each preset it
+/// passes (see the settle in the terminal loop): the row cannot honestly show a
+/// preset the machine is not in, and walking it is previewing them one after
+/// another.  `slot` names where `save` writes and applies nothing on its own.
+///
+/// The choosers whose steps are honoured differently are built elsewhere:
+/// `structural_choice` for the face (the page is written again; no session is lost)
+/// and `launch_choice` for the target and the geometry (only a press restarts).
 ///
 /// The list is owned because the preset chooser is the built-ins plus the names
 /// the user has saved, which the compiler cannot know.
@@ -2091,6 +2099,11 @@ fn run_terminal_window(
                     // The chooser names the preset through what it *shows*, not
                     // through its own name, and `custom` - the value past the end
                     // of the list - names no preset at all, so it applies nothing.
+                    // Unlike the launch rows above, a *step* applies here as a press
+                    // does, and that is deliberate: the row is a view of the other
+                    // rows, so it can only show a preset the machine is actually in.
+                    // Walking it previews the presets one after another, and the
+                    // note line names each one as it lands.
                     let shown = panel.rows[row].shown();
                     let preset = if name == "preset" && presets.bundle(&shown).is_some() {
                         Some(shown)

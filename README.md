@@ -299,7 +299,12 @@ Rows are sliders, boxes that toggle, lists that step, and **presets**: `wyse` an
 `tek` as bundles of rows, showing `custom` when the machine matches neither.
 They can be saved into numbered slots - `slot` names one, `save` writes the
 current rows into it - and the saved ones live in a plain-text file under the
-user's config directory, never in the repository.  A few rows are *launch* rows
+user's config directory, never in the repository.  The preset chooser is a *view*
+of the rows below it rather than a value of its own, which is why walking it
+applies each preset as it passes: it cannot honestly show a preset the machine is
+not in.  `slot` just names where a save goes and does nothing on its own.
+
+A few rows are *launch* rows
 (`device`, `zoom` and `shrink` in the plot path): they cannot take effect on a
 running window, so they are honoured by re-executing the program with the options
 the panel currently holds.  **Only a press does that** - Enter on the row, or a
