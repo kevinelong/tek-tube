@@ -1,0 +1,5 @@
+# cmd.exe is happiest with CRLF, and the uninstaller's self-delete relies on how
+# cmd parses `goto`; a batch file that arrives with LF endings is a lottery.
+# The Rust and Markdown files stay as they are.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
