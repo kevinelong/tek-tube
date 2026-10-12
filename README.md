@@ -224,7 +224,7 @@ of the tube.
 
 ```sh
 cargo build --release          # binary in target/release/tek-tube
-cargo test                     # 114 unit and end-to-end tests (2 ignored)
+cargo test                     # 117 unit and end-to-end tests (2 ignored)
 ```
 
 Play a file in a window (ESC or the close button quits):
@@ -283,24 +283,39 @@ rather than restyling it, and the shell and the tube simply carry on: nothing is
 lost but the image, which the pen redraws (see below).  ESC quits.
 
 **F2 opens the options panel**: the variables a terminal run honours, adjustable
-while it runs - the pen rate, the phosphor, the trail, the cell size.  A slider
-follows the mouse at once, but the tube is recomposed only once the dragging has
-*settled*, a quarter of a second after the last change: a fullscreen frame is
+while it runs - the pen rate, the phosphor, the trail, the cell size, the face.  A
+slider follows the mouse at once, but the tube is recomposed only once the dragging
+has *settled*, a quarter of a second after the last change: a fullscreen frame is
 ~35 ms and recomposing on every mouse move would spend a core showing the same
-picture with one number different.  Only the cell size needs the page written
-again.  A click on a slider jumps the value there and starts a drag; the wheel
-nudges the row under the pointer.  The panel is drawn over the frame that is
-already there, so it stays with the mouse while the costly half waits.
+picture with one number different.  Only two rows need the page *written* again
+rather than recomposed - the cell size and the face - and the terminal does that by
+clearing its record and writing the page in the new rules.  Neither ends anything:
+a face change costs a page, not a session.  A click on a slider jumps the value
+there and starts a drag; the wheel nudges the row under the pointer.  The panel is
+drawn over the frame that is already there, so it stays with the mouse while the
+costly half waits.
 
 Rows are sliders, boxes that toggle, lists that step, and **presets**: `wyse` and
 `tek` as bundles of rows, showing `custom` when the machine matches neither.
 They can be saved into numbered slots - `slot` names one, `save` writes the
 current rows into it - and the saved ones live in a plain-text file under the
 user's config directory, never in the repository.  A few rows are *launch* rows
-(`font` in the terminal; `device`, `zoom` and `shrink` in the plot path): they
-cannot take effect on a running window, so pressing one re-executes the program
-with the options the panel currently holds.  That ends the session, and the note
-line says so before it happens.
+(`device`, `zoom` and `shrink` in the plot path): they cannot take effect on a
+running window, so they are honoured by re-executing the program with the options
+the panel currently holds.  **Only a press does that** - Enter on the row, or a
+click - and the note line says the session ends before it does; the wheel walks the
+list and changes nothing but the number shown, so browsing the targets or the zoom
+levels cannot restart the program under a hand that was only looking.
+
+The face used to be a launch row too, for the same reason the target is - it is
+fixed when the tube is built - and the cost was the whole session for a change that
+is only how glyphs are stroked.  It is a *rendering* row now: the tube is configured
+with the new face, the record is cleared and the page is written again, and the shell
+underneath never notices.  Measured through the terminal harness with no window
+(`TEK_REFONT`), on one page and one session: `mono` -> `simplex` moves the lit pixels
+21594 -> 37525, and asking for the same face twice moves them 21594 -> 20704, so the
+number follows the face and not the rewrite; a command typed after four face changes
+was answered by the shell it was typed into.
 
 For a plot file the window is the whole primary monitor and the face is rendered
 at the largest integer down-sample that fits the screen, then *centred without

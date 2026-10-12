@@ -47,11 +47,15 @@ pub struct Row {
     /// recomposed.
     pub structural: bool,
     /// Whether the value can only be honoured by *relaunching* the program with
-    /// it, rather than by feeding it to the running tube.  A different target,
-    /// a different window size or a different face is fixed when the process
-    /// starts, so the panel still steps and draws the row like any other, but
-    /// the caller works out a fresh command line when the change settles instead
-    /// of applying the number to a machine that cannot read it.
+    /// it, rather than by feeding it to the running tube.  A different target or a
+    /// different window size is fixed when the process starts, so the panel still
+    /// steps and draws the row like any other, but the caller works out a fresh
+    /// command line when the change settles instead of applying the number to a
+    /// machine that cannot read it.
+    ///
+    /// Only a *press* does that: a step through the list with the wheel (or a
+    /// drag) moves the number and says so on the note line, so browsing cannot end
+    /// a session by itself.
     pub launch: bool,
 }
 
@@ -118,6 +122,10 @@ pub struct Panel {
     changed_at: Option<Instant>,
     /// Which row that was.
     last_changed: Option<usize>,
+    /// Whether that change was a *press* - Enter, or a click on the row - rather
+    /// than a step.  A launch row only restarts the program on a press, so that
+    /// walking a list with the wheel can never end a session by accident.
+    last_press: bool,
     /// A line under the panel saying what the last change did.
     pub note: String,
     /// True if a settled change needs the tube reconfigured and rewritten.
@@ -133,6 +141,7 @@ impl Panel {
             selected: 0,
             changed_at: None,
             last_changed: None,
+            last_press: false,
             note: "F2 closes; click a row, or walk with the arrows and Enter".to_string(),
             needs_rebuild: false,
         }
@@ -196,24 +205,26 @@ impl Panel {
         self.metrics(h).track_w
     }
 
-    /// A change was made: note when, and whether the row that changed needs the
-    /// tube reconfigured.  It is the *row* that decides, not the drag: a choice or
-    /// a toggle has no drag and can still be structural.
-    fn touched(&mut self, row: usize) {
+    /// A change was made: note when, whether it was a press, and whether the row
+    /// that changed needs the tube reconfigured.  It is the *row* that decides,
+    /// not the drag: a choice or a toggle has no drag and can still be structural.
+    fn touched(&mut self, row: usize, press: bool) {
         self.changed_at = Some(Instant::now());
         self.last_changed = Some(row);
+        self.last_press = press;
         self.needs_rebuild |= self.rows[row].structural;
     }
 
-    /// Has the dragging settled?  `Some(row)` once, `SETTLE_SECONDS` after the last
-    /// change, naming the row that changed so the caller can apply the part that
-    /// only that variable needs.  A drag refreshes the tube when it stops rather
-    /// than while it moves.
-    pub fn settle_due(&mut self, now: Instant) -> Option<usize> {
+    /// Has the dragging settled?  `Some((row, press))` once, `SETTLE_SECONDS`
+    /// after the last change, naming the row that changed and whether the change
+    /// was a press, so the caller can apply the part that only that variable needs
+    /// and can tell a deliberate choice from a step through a list.  A drag
+    /// refreshes the tube when it stops rather than while it moves.
+    pub fn settle_due(&mut self, now: Instant) -> Option<(usize, bool)> {
         match self.changed_at {
             Some(t) if now.duration_since(t).as_secs_f32() >= SETTLE_SECONDS => {
                 self.changed_at = None;
-                self.last_changed
+                self.last_changed.map(|row| (row, self.last_press))
             }
             _ => None,
         }
@@ -306,19 +317,30 @@ impl Panel {
             }
         }
         if changed {
-            self.touched(i);
+            // A press is Enter, or a click on the row: the two acts that mean
+            // "this one".  The wheel steps a value without meaning to commit to
+            // it, which is what makes a list safe to walk through - and the reason
+            // a launch row cannot restart the program under a browsing hand.
+            let press = matches!(act, Act::Enter | Act::Click(_));
+            self.touched(i, press);
             // A row that can only be honoured by starting over says so here,
             // before anything happens: the note line exists so the machine never
             // does something the user was not told about, and a session being
-            // replaced is the largest thing it does.
-            self.note = if self.rows[i].launch {
-                format!(
+            // replaced is the largest thing it does.  A *step* through such a row
+            // says what the step did instead, because by itself it changes
+            // nothing but the number shown.
+            self.note = match (self.rows[i].launch, press) {
+                (true, true) => format!(
                     "{} = {} - relaunch: session ends",
                     self.rows[i].name,
                     self.rows[i].shown()
-                )
-            } else {
-                format!("{} = {}", self.rows[i].name, self.rows[i].shown())
+                ),
+                (true, false) => format!(
+                    "{} = {} - press the row to restart with it",
+                    self.rows[i].name,
+                    self.rows[i].shown()
+                ),
+                (false, _) => format!("{} = {}", self.rows[i].name, self.rows[i].shown()),
             };
         }
         changed
@@ -738,8 +760,8 @@ mod tests {
         );
         assert_eq!(
             p.settle_due(now + Duration::from_millis(200 + 300)),
-            Some(0),
-            "and it names the row once the dragging has stopped"
+            Some((0, true)),
+            "and it names the row once the dragging has stopped, as a press"
         );
         assert!(
             p.settle_due(now + Duration::from_millis(400)).is_none(),
@@ -800,7 +822,8 @@ mod tests {
         // and a step settles like any other change, naming the row
         assert_eq!(
             p.settle_due(Instant::now() + Duration::from_millis(400)),
-            Some(0)
+            Some((0, true)),
+            "a click is a press"
         );
     }
 
@@ -845,8 +868,8 @@ mod tests {
         assert!(p.needs_rebuild, "the cell size is structural");
         assert_eq!(
             p.settle_due(Instant::now() + Duration::from_millis(400)),
-            Some(1),
-            "the settle names the row the keyboard changed"
+            Some((1, true)),
+            "the settle names the row the keyboard changed, and that Enter is a press"
         );
     }
 
@@ -892,6 +915,81 @@ mod tests {
             p.note
         );
         assert!(!p.needs_rebuild, "a relaunch is not a tube reconfigure");
+        assert_eq!(
+            p.settle_due(Instant::now() + Duration::from_millis(400)),
+            Some((0, true)),
+            "and a press is what commits it"
+        );
+    }
+
+    /// The wheel walks a launch row without committing to it.  The number moves,
+    /// the note says what a press would do instead, and the caller is told this was
+    /// a *step* - so browsing the list of targets cannot restart the program under
+    /// a hand that was only looking.
+    #[test]
+    fn a_step_through_a_launch_row_browses_without_committing() {
+        let mut p = Panel::new(vec![Row {
+            name: "zoom",
+            kind: Kind::Choice(names(&["1", "2", "3", "4"])),
+            value: 0.0,
+            structural: false,
+            launch: true,
+        }]);
+        p.open = true;
+        let cx = p.control_x(H);
+        let (_, ry) = p.row_y(W, H, 0);
+        assert!(p.handle(
+            W,
+            H,
+            ((cx + 5) as f32, (ry + 4) as f32),
+            false,
+            -1.0
+        ));
+        assert_eq!(
+            p.rows[0].shown(),
+            "4",
+            "the wheel stepped back past the first entry"
+        );
+        assert!(
+            p.note.contains("press the row to restart"),
+            "the note has to say how it is committed: {}",
+            p.note
+        );
+        assert_eq!(
+            p.settle_due(Instant::now() + Duration::from_millis(400)),
+            Some((0, false)),
+            "and the caller is told this was a step, not a press"
+        );
+    }
+
+    /// A structural row - the face - is applied by writing the page again rather
+    /// than by a relaunch, and the panel says so with its own flag rather than on
+    /// the note line: nothing is ending.
+    #[test]
+    fn a_structural_row_asks_for_a_rebuild_not_a_restart() {
+        let mut p = Panel::new(vec![Row {
+            name: "font",
+            kind: Kind::Choice(names(&["simplex", "mono", "gothic"])),
+            value: 0.0,
+            structural: true,
+            launch: false,
+        }]);
+        p.open = true;
+        let cx = p.control_x(H);
+        let (_, ry) = p.row_y(W, H, 0);
+        p.handle(W, H, ((cx + 5) as f32, (ry + 4) as f32), false, -1.0);
+        assert_eq!(p.rows[0].shown(), "gothic", "the wheel stepped the face");
+        assert!(p.needs_rebuild, "the tube has to be configured again");
+        assert!(
+            !p.note.contains("session ends"),
+            "a face is not a session: {}",
+            p.note
+        );
+        assert_eq!(
+            p.settle_due(Instant::now() + Duration::from_millis(400)),
+            Some((0, false)),
+            "and it is not a launch, whoever asked for it"
+        );
     }
 
     /// A choice list built while the program runs - the built-in presets plus

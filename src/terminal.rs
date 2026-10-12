@@ -1320,6 +1320,25 @@ impl Terminal {
         );
     }
 
+    /// Write the page again as the tube's rules now read it.
+    ///
+    /// A font change is a *rendering* change: the cells hold the same characters,
+    /// so nothing is stale and an incremental commit would draw nothing at all.
+    /// The record is cleared and the page marked for replacement - the recipe
+    /// `resize` uses when the page under the shell changes shape - so the pen
+    /// writes the whole page again.  A storage tube needs exactly that: the charge
+    /// already on the target is in the old face and cannot be rewritten, so the
+    /// page is wiped and written again, flash and all.
+    pub fn restroke(&mut self) {
+        self.pen.resize(self.cols * self.rows);
+        self.last_screen.clear();
+        self.last_screen.resize(self.cols * self.rows, ' ');
+        self.flash_screen.clear();
+        self.flash_screen.resize(self.cols * self.rows, (' ', false));
+        self.page_replaced = true;
+        self.committed = false;
+    }
+
     /// Change the page size and tell the shell.  The tube follows the window,
     /// so the cell size stays about the same and the glyphs do not have to be
     /// re-scaled.

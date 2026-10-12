@@ -995,10 +995,29 @@ fn choice(name: &'static str, list: &[String], index: usize) -> panel::Row {
     }
 }
 
-/// A chooser whose value can only be honoured by relaunching the program: a
-/// different target, page size or face is fixed when the process starts, so the
-/// panel offers it but the settle builds a fresh command line instead of applying
-/// the number to a machine that cannot read it.
+/// A chooser the running tube can honour by writing the page again in the new
+/// rules: the face.
+///
+/// A face is not fixed when the process starts after all - the tube holds it, and
+/// the terminal can clear its record and write the page again - so this is a
+/// *structural* row rather than a relaunch one.  Changing it costs a page, not a
+/// session: a storage tube cannot rewrite the glyphs already stored, so the page is
+/// wiped and drawn again in the new face, and the shell underneath never notices.
+fn structural_choice(name: &'static str, list: &[&str], index: usize) -> panel::Row {
+    panel::Row {
+        name,
+        kind: panel::Kind::Choice(owned(list)),
+        value: index as f32,
+        structural: true,
+        launch: false,
+    }
+}
+
+/// A chooser whose value can only be honoured by relaunching the program: the
+/// target and the geometry are fixed when the process starts, so the panel offers
+/// them but the settle builds a fresh command line instead of applying the number
+/// to a machine that cannot read it.  Only a *press* does that; a step with the
+/// wheel browses.
 fn launch_choice(name: &'static str, list: &[&str], index: usize) -> panel::Row {
     panel::Row {
         name,
@@ -1405,9 +1424,10 @@ fn raw_rows(opts: &Options, tube: &Tube, presets: &Presets) -> Vec<panel::Row> {
     // Only the variables a *terminal* run honours.  --device, --zoom, --shrink,
     // --text-scale, --threads, --no-autoclear and --no-enhanced belong to the plot
     // path (there is no 12 bit coordinate stream and no file being decoded here),
-    // so a control for them would move a number that nothing reads.  --font is
-    // honoured here - it sets the tube's face - but only when the tube is built,
-    // so it is a relaunch row rather than a live one.
+    // so a control for them would move a number that nothing reads.  --font *is*
+    // honoured here: the tube holds the face, so it is a structural row - the tube
+    // is configured with the new face and the page is written again - and no part
+    // of a session is lost by changing it.
     vec![
         // A preset is a *state*, not a value, so the rows start with one chooser
         // that shows which preset the values below it match.  It is filled in
@@ -1433,7 +1453,7 @@ fn raw_rows(opts: &Options, tube: &Tube, presets: &Presets) -> Vec<panel::Row> {
         slider("bloom-wide", 0.0, 0.3, ph.bloom_wide, false),
         slider("lens", 0.0, 1.2, ph.cam_blur, false),
         toggle("camera", opts.camera as u8 as f32, false),
-        launch_choice("font", FONTS, index_of(FONTS, face_name(opts.font))),
+        structural_choice("font", FONTS, index_of(FONTS, face_name(opts.font))),
         slider("scan", 0.0, 0.95, ph.scan_depth, false),
         slider("dots", 0.0, 32.0, tube.dot_rows as f32, false),
         slider("trail", 0.0, 2.0, opts.trail.unwrap_or(1.1), false),
@@ -2047,12 +2067,12 @@ fn run_terminal_window(
                     .unwrap_or((0.0, 0.0));
                 let down = window.get_mouse_down(MouseButton::Left);
                 panel.handle(tube.w as usize, tube.h as usize, pos, down, 0.0);
-                if let Some(row) = panel.settle_due(Instant::now()) {
+                if let Some((row, press)) = panel.settle_due(Instant::now()) {
                     let name = panel.rows[row].name;
-                    if panel.rows[row].launch {
-                        // A relaunch row moves nothing the running tube can read: a
-                        // different face is fixed when the tube is built.  The panel
-                        // has already said on its note line that the session ends.
+                    if panel.rows[row].launch && press {
+                        // A relaunch row moves nothing the running tube can read: the
+                        // target is fixed when the tube is built.  The panel has
+                        // already said on its note line that the session ends.
                         // Everything set by hand is in the rows, so they are written
                         // into the options and the caller builds the fresh command
                         // line from those, not from the line this process was started
@@ -2060,6 +2080,13 @@ fn run_terminal_window(
                         apply_rows(opts, &panel.rows);
                         relaunch = true;
                         break;
+                    }
+                    if panel.rows[row].launch {
+                        // A *step* through such a row moved the number the panel shows
+                        // and nothing else.  The note line says a press is what
+                        // restarts with it; here the session carries on.
+                        dirty = true;
+                        continue;
                     }
                     // The chooser names the preset through what it *shows*, not
                     // through its own name, and `custom` - the value past the end
@@ -2152,9 +2179,13 @@ fn run_terminal_window(
                     tube.phosphor = base_phosphor.clone();
                     configure_terminal_tube(tube, dev, opts, terminal::cell_scale_of(tube.w, cols));
                     if panel.needs_rebuild {
-                        // the cell size changed: write the page again with the new
-                        // rules rather than leaving the glyphs the old ones drew
-                        term.commit(tube);
+                        // A structural row changed what the rendering *means* - the
+                        // face, or the cell size - so the page is written again with
+                        // the new rules rather than left as the old ones drew it.  The
+                        // cells hold the same characters, so nothing is stale and a
+                        // plain commit would draw nothing at all: `restroke` clears
+                        // the record and asks for the page to be replaced.
+                        term.restroke();
                         panel.needs_rebuild = false;
                     }
                     dirty = true;
@@ -2459,7 +2490,13 @@ fn run_window(
                 let pos = (pos.0 - off.0, pos.1 - off.1);
                 let held = window.get_mouse_down(MouseButton::Left);
                 panel.handle(ow, oh, pos, held, 0.0);
-                if let Some(row) = panel.settle_due(Instant::now()) {
+                if let Some((row, press)) = panel.settle_due(Instant::now()) {
+                    if panel.rows[row].launch && !press {
+                        // a step through a relaunch row: the number moved, nothing
+                        // else did, and the note line says a press is what restarts
+                        dirty = true;
+                        continue;
+                    }
                     // the panel's rows are the source; the one mapping writes them
                     // into the options and the tube is configured from those
                     apply_rows(opts, &panel.rows);
@@ -2693,6 +2730,10 @@ mod harness {
     /// Environment:
     ///   TEK_ARGS     the program's own options (a shell is added if none is named)
     ///   TEK_SCRIPT   commands to type, separated by ';' (default: none)
+    ///   TEK_REFONT   change the face this way, the way the panel's font row does -
+    ///                the tube configured again and the page written again - and
+    ///                report the ink before and after and whether the session
+    ///                answered a command typed after the change (default: none)
     ///   TEK_WAIT     seconds to run after each command (default 2)
     ///   TEK_SECONDS  seconds to run after the script has been typed (default 6)
     ///   TEK_SIZE     the tube, WxH (default 1280x720)
@@ -2733,7 +2774,7 @@ mod harness {
                 "{root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
             ));
         }
-        let opts = parse_args_from(argv.into_iter().skip(1))
+        let mut opts = parse_args_from(argv.into_iter().skip(1))
             .expect("TEK_ARGS should parse")
             .expect("TEK_ARGS asked for --help, so there is nothing to run");
         let shell = opts.shell.clone().expect("the driver needs a shell");
@@ -2808,6 +2849,51 @@ mod harness {
             std::thread::sleep(std::time::Duration::from_millis(20));
             cb.set_key_state(Key::Enter, false);
             pump!(wait);
+        }
+
+        // The live face change the panel's `font` row makes: the tube is
+        // configured with the new face and the page is written again, and the shell
+        // underneath is never touched.  `TEK_REFONT=gothic` measures it - the ink
+        // before and after, and whether the session still answers a command typed
+        // afterwards - which is the claim the row rests on.  A comma separated list
+        // cycles through them in one session, so the numbers are comparable: the
+        // same page, the same shell, one face after another.
+        if let Ok(want) = std::env::var("TEK_REFONT") {
+            let mark = "REFONT_SESSION_ALIVE";
+            let mut told = false;
+            for want in want.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+                let face = match want {
+                    "simplex" => Face::Simplex,
+                    "gothic" => Face::Gothic,
+                    _ => Face::Mono,
+                };
+                let before = lit(&mut tube);
+                opts.font = face;
+                configure_terminal_tube(&mut tube, opts.device, &opts, cell);
+                term.restroke();
+                pump!(2.0);
+                println!(
+                    "REFONT {want}: lit {before} -> {}, page replaced without the shell{}",
+                    lit(&mut tube),
+                    if told { " (still the same session)" } else { "" }
+                );
+                told = true;
+            }
+            for c in format!("echo {mark}").chars() {
+                cb.add_char(c as u32);
+                std::thread::sleep(std::time::Duration::from_millis(6));
+            }
+            cb.set_key_state(Key::Enter, true);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cb.set_key_state(Key::Enter, false);
+            pump!(2.0);
+            let text: String = (0..term.cols * term.rows)
+                .map(|i| term.screen.visible_char(i % term.cols, i / term.cols))
+                .collect();
+            println!(
+                "REFONT session answered after the changes: {}",
+                text.contains(mark)
+            );
         }
 
         let seq = std::env::var("TEK_SEQ").ok();
@@ -3032,9 +3118,20 @@ mod tests {
         let rows = panel_rows(&opts, &tube, &Presets::builtins());
         assert!(rows.len() >= 20, "the panel lists the terminal's variables");
         assert_eq!(
-            rows.iter().filter(|r| r.structural).count(),
-            1,
-            "only the cell size needs the page written again"
+            rows.iter().filter(|r| r.launch).count(),
+            0,
+            "no terminal row needs a relaunch: even the face is written again, not started over"
+        );
+        let mut structural: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.structural)
+            .map(|r| r.name)
+            .collect();
+        structural.sort_unstable();
+        assert_eq!(
+            structural,
+            vec!["cell", "font"],
+            "the cell size and the face are the rows the page has to be written again for"
         );
         let structural = apply_rows(&mut opts, &rows);
         assert!(structural, "the cell row is structural");
@@ -3104,14 +3201,37 @@ mod tests {
         // nothing is applied while the dragging is fresh
         assert!(opts.scan.is_none(), "not before the settle");
         let settled = panel.settle_due(Instant::now() + std::time::Duration::from_millis(400));
-        let row = settled.expect("the settle names the row that moved");
+        let (row, press) = settled.expect("the settle names the row that moved");
         assert_eq!(panel.rows[row].name, "scan");
+        assert!(press, "a mouse press is a press");
         apply_rows(&mut opts, &panel.rows);
         let applied = opts.scan.expect("the option was set");
         assert!(
             (applied - 0.71).abs() < 0.05,
             "three quarters along the 0..0.95 track: {applied}"
         );
+    }
+
+    /// The face is a *rendering* change, so the row that sets it is structural and
+    /// not a launch: the tube is configured again with the new face and the page is
+    /// written again, and the session survives.  The rows that really are fixed when
+    /// the process starts stay launch rows, and those are in the plot panel.
+    #[test]
+    fn the_face_is_live_and_the_geometry_is_not() {
+        let mut opts = Options::default();
+        opts.font = Face::Mono;
+        let tube = configured(Tube::new(1024, 780), &opts);
+        let rows = panel_rows(&opts, &tube, &Presets::builtins());
+        let font = rows.iter().find(|r| r.name == "font").expect("the font row");
+        assert!(font.structural, "the page has to be written again");
+        assert!(!font.launch, "and no session has to end for it");
+        assert_eq!(font.shown(), "mono", "the row shows the face in use");
+
+        let plot = plot_rows(&opts, &tube);
+        for name in ["device", "zoom", "shrink"] {
+            let row = plot.iter().find(|r| r.name == name).expect(name);
+            assert!(row.launch, "{name} is fixed when the process starts");
+        }
     }
 
     /// Build the tube the way a launch does, so the rows that are read from the
