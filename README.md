@@ -736,7 +736,7 @@ them again.
 ```sh
 tools\setup.cmd                                        # ask
 tools\setup.cmd -List                                  # what is on this machine
-tools\setup.cmd -Shells "Windows PowerShell","Git Bash" -Default "Git Bash"
+tools\setup.cmd -Shells "Windows PowerShell,Git Bash" -Default "Git Bash"
 tools\setup.cmd -InstallDir C:\tools\tek-tube -NoShortcuts   # install, no Start Menu
 tools\uninstall.cmd                                    # remove (-Purge: the settings too)
 ```

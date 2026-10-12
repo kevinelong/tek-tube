@@ -25,7 +25,8 @@
   ..\target\release\tek-tube.exe when run from a source checkout.
 
 .PARAMETER Shells
-  The shells to offer, without prompting.  A name that matches one found on the
+  The shells to offer, without prompting, as one comma separated list:
+  `-Shells "Windows PowerShell,Git Bash"`.  A name that matches one found on the
   machine is used as it is; "Name=command line" adds a shell of your own.  Names
   with spaces are the ones the Start Menu entries use, so keep them short.
 
@@ -46,7 +47,7 @@
   .\setup.cmd
 
 .EXAMPLE
-  .\setup.cmd -Shells 'Windows PowerShell','Git Bash','WSL (Ubuntu)' -Default 'Git Bash'
+  .\setup.cmd -Shells "Windows PowerShell,Git Bash,WSL (Ubuntu)" -Default "Git Bash"
 
 .EXAMPLE
   .\setup.cmd -InstallDir C:\tools\tek-tube -NoShortcuts -Quiet
@@ -132,21 +133,29 @@ function Find-Shells {
 # The shells to offer: the ones named on the command line, or the ones picked at
 # the prompt.  Returns a list of [Name, Command] pairs.
 function Choose-Shells($found) {
-    if ($Shells) {
+    # -Shells arrives as an array when this is called from PowerShell
+    # (-Shells 'a','b') and as one comma separated string when setup.cmd is run from
+    # cmd.exe, which does not split it.  Both are accepted, because setup.cmd is what
+    # most people run: `-Shells "Windows PowerShell,Git Bash"` works either way.
+    $wanted = @($Shells |
+        ForEach-Object { $_ -split ',' } |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ })
+    if ($wanted.Count) {
         $chosen = New-Object System.Collections.ArrayList
-        foreach ($wanted in $Shells) {
-            if ($wanted -match '=') {
+        foreach ($name in $wanted) {
+            if ($name -match '=') {
                 # "Name=command line": a shell of your own, no detection involved
-                $name, $command = $wanted -split '=', 2
+                $parts = $name -split '=', 2
                 [void]$chosen.Add([pscustomobject]@{
-                    Name = $name.Trim(); Command = $command.Trim()
+                    Name = $parts[0].Trim(); Command = $parts[1].Trim()
                 })
                 continue
             }
-            $match = $found | Where-Object { $_.Name -ieq $wanted } | Select-Object -First 1
+            $match = $found | Where-Object { $_.Name -ieq $name } | Select-Object -First 1
             if (-not $match) {
                 $available = ($found | ForEach-Object { $_.Name }) -join ', '
-                throw "no shell called '$wanted' was found.  Found: $available"
+                throw "no shell called '$name' was found.  Found: $available"
             }
             [void]$chosen.Add($match)
         }
