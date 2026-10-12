@@ -587,6 +587,24 @@ impl Tube {
         (self.w * self.h) as usize
     }
 
+    /// Clear the target, as the terminal's ERASE does - but only the state it
+    /// leaves behind, not the erase itself.
+    ///
+    /// A real erase is a transient and none of it is modelled.  Measured on a
+    /// 4052 (frames from <https://www.youtube.com/watch?v=MfJ23mmyhJE>; the
+    /// analysis is in the session notes beside this repository,
+    /// `cls3/VIDEO-4052-SIMPLE-DEMO-2026-10-11.md`), across 13
+    /// erases in seven minutes: the whole face flashes white for about 0.13 s,
+    /// saturating a camera whose exposure is provably fixed, so the flash's
+    /// level is at least "every pixel as bright as a stroke's core" - a whole
+    /// face at that level, where the drawing it replaces held a few per cent
+    /// of one.  What follows is the opposite of a glow: the flood gun's field
+    /// is *suppressed*, 0.12 of its former level 0.3 s later, about half of it
+    /// for the first few seconds, and still climbing twenty seconds on, so a
+    /// face erased often never reaches its equilibrium brightness.  Both halves
+    /// of the transient are unmeasured in the direction that matters: the
+    /// flash's level clips in the recording, and the recovery's asymptote is
+    /// entangled with the erased drawing's own halation.
     pub fn erase(&mut self) {
         self.stored.iter_mut().for_each(|v| *v = 0.0);
         self.fresh.iter_mut().for_each(|v| *v = 0.0);
