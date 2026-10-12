@@ -21,7 +21,7 @@
 
 use crate::panel;
 use crate::protocol::{LineStyle, Style, Write};
-use crate::tube::Tube;
+use crate::tube::{CursorMark, Tube};
 use crate::vt;
 use crate::vt::PageChange;
 use minifb::Key;
@@ -1537,9 +1537,10 @@ pub fn stroke_changed(
 ///
 /// On a storage tube the cursor *is* the beam position, so it is never committed -
 /// and it cannot be a flash either, or it fades away within a second and the tube is
-/// left with no cursor at all.  It is a steady mark at stored-ink level, which is
-/// what the hardware's own hosts produced when they wrote a cursor and redrew the
-/// page to move it (see `Tube::cursor`).
+/// left with no cursor at all.  It is a steady mark at stored-ink level, drawn with the
+/// stroke width the terminal's glyphs are stroked with, which is what the hardware's own
+/// hosts produced when they wrote a cursor and redrew the page to move it (see
+/// `Tube::cursor`).
 pub fn set_cursor(screen: &vt::Screen, cols: usize, rows: usize, tube: &mut Tube) {
     if !screen.cursor_visible {
         tube.cursor = None;
@@ -1549,8 +1550,18 @@ pub fn set_cursor(screen: &vt::Screen, cols: usize, rows: usize, tube: &mut Tube
     let ch = (tube.h / rows as i32).max(1);
     let cx = screen.cx.min(cols - 1);
     let cy = screen.cy.min(rows - 1);
-    let y = tube.h - ch - (cy as f32 * ch as f32).round() as i32;
-    tube.cursor = Some((cx as i32 * cw + 2, cx as i32 * cw + cw - 2, y + 2, y + 3));
+    // the cell's own box, so an underscore's width is the cell's width: it sits two
+    // dots in from each edge and two dots above the bottom, the way the font's own
+    // underscore sits in a cell
+    let left = cx as i32 * cw + 2;
+    let right = cx as i32 * cw + cw - 2;
+    let y = tube.h - ch - (cy as f32 * ch as f32).round() as i32 + 2;
+    tube.cursor = Some(CursorMark {
+        x0: left,
+        x1: right,
+        y,
+        sigma: tube.sigma,
+    });
 }
 
 /// The panel key a window key names, if it is one the options panel uses.
@@ -2560,7 +2571,7 @@ mod tests {
         screen.cursor_visible = true;
         let (cols, rows) = (74usize, 35usize);
         set_cursor(&screen, cols, rows, &mut tube);
-        let (x, y) = tube.cursor.map(|(x0, x1, y, _)| ((x0 + x1) / 2, y)).unwrap();
+        let (x, y) = tube.cursor.map(|m| ((m.x0 + m.x1) / 2, m.y)).unwrap();
         let mut buf = Vec::new();
         // the frame is in image orientation: tube y is output row h - 1 - y
         let green = |tube: &mut Tube, buf: &mut Vec<u32>| {

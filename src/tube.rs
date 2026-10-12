@@ -454,6 +454,22 @@ pub fn box_drawing_code(c: char) -> Option<u8> {
     Some(0x80 + (acs - 0x5f))
 }
 
+/// The cursor's underline: a stroked segment from `(x0, y)` to `(x1, y)`, with the
+/// stroke width the terminal draws its glyphs with.
+///
+/// Drawn as *light* through the same Gaussian beam profile a stroke deposits charge
+/// with (`exp(-d^2 / 2 sigma^2)`, `PROFILE_REACH` wide), so the underline is as thick
+/// and as soft as the glyphs beside it and takes the same halo - rather than a crisp
+/// rectangle of a width nobody chose.  See `Tube::cursor` for why the cursor is light
+/// and not charge.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct CursorMark {
+    pub x0: i32,
+    pub x1: i32,
+    pub y: i32,
+    pub sigma: f32,
+}
+
 pub struct Tube {
     pub w: i32,
     pub h: i32,
@@ -514,23 +530,22 @@ pub struct Tube {
     /// headless run can be shown to have taken one.
     pub ghosted_cells: usize,
 
-    /// The cursor's underline, as `(x0, x1, y0, y1)` in target dots, drawn into
-    /// the frame as light of its own.
-    ///
-    /// Not charge, and deliberately not a *flash* either.  A cursor has to be
-    /// visible whenever the shell is waiting, and the two ways a storage tube can
-    /// offer that both fail: charged into the image it would be permanent (and
-    /// leave a trail of itself wherever it moved), and written transiently it
-    /// fades within a second and the tube is left with no cursor at all.  The
-    /// hardware's own hosts wrote a cursor as *stored* ink and redrew the page to
-    /// move it, which is a steady mark - so this is a steady mark, drawn at the
-    /// level stored ink reaches, over the phosphor rather than in it.
-    ///
-    /// Because it is not a population, it does not make the tube *alive*: a tube
-    /// sitting at a waiting prompt still has nothing to recompose, which the flash
-    /// version could not manage - a cursor refreshed forever kept the whole 1024x780
-    /// frame being rebuilt ~58 times a second for one underline.
-    pub cursor: Option<(i32, i32, i32, i32)>,
+/// The cursor's underline, as light the render adds to the frame.
+///
+/// Not charge, and deliberately not a *flash* either.  A cursor has to be
+/// visible whenever the shell is waiting, and the two ways a storage tube can
+/// offer that both fail: charged into the image it would be permanent (and
+/// leave a trail of itself wherever it moved), and written transiently it
+/// fades within a second and the tube is left with no cursor at all.  The
+/// hardware's own hosts wrote a cursor as *stored* ink and redrew the page to
+/// move it, which is a steady mark - so this is a steady mark, drawn at the
+/// level stored ink reaches, over the phosphor rather than in it.
+///
+/// Because it is not a population, it does not make the tube *alive*: a tube
+/// sitting at a waiting prompt still has nothing to recompose, which the flash
+/// version could not manage - a cursor refreshed forever kept the whole 1024x780
+/// frame being rebuilt ~58 times a second for one underline.
+pub cursor: Option<CursorMark>,
 
     /// Paint glyphs as a dot matrix this many dots tall, the way a terminal's
     /// character ROM is built, rather than traced strokes.  Zero - the default -
@@ -1354,7 +1369,23 @@ impl Tube {
             // where it was, like the light a raster terminal left behind
             let ghost: &[f32] = if ghost.len() == tw * th { ghost } else { &[] };
             let ghost_scale = *ghost_scale;
-            let cursor_rect = *cursor;
+            let cursor_mark = *cursor;
+            // The cursor is drawn at the level a *just written* stroke reaches - the
+            // stored gain plus the full fresh gain, the pair that puts a fresh stroke
+            // at full scale - and not the decayed `gf` the loop above uses: a host
+            // keeping its cursor written keeps it hot, and it is the beam's own mark,
+            // so it should read like fresh ink rather than like settled ink.  It is
+            // also what makes it stand out on a page that has cooled.
+            // ... and the fresh part of it goes into `fl` as well, which is the
+            // channel the colour pass reads for the *hot* chromaticity: a stroke is
+            // white-green because of the light the write beam just added, and without
+            // this the cursor would be drawn at full level in the settled green.
+            let cursor_gain = gs + self.phosphor.fresh_gain;
+            let cursor_fresh = self.phosphor.fresh_gain;
+            // the footprint a stroke of this width deposits, hoisted out of the loop
+            let cursor_sigma = cursor.map(|m| m.sigma.max(0.5)).unwrap_or(1.0);
+            let cursor_reach = PROFILE_REACH * cursor_sigma;
+            let cursor_inv2s2 = 1.0 / (2.0 * cursor_sigma * cursor_sigma);
             // a scroll slides: the image is already where it belongs, and the
             // offset shows it displaced down the face until the slide finishes
             let off = *render_offset as i64;
@@ -1386,16 +1417,21 @@ impl Tube {
                                 if !ghost.is_empty() {
                                     light += ghost[i] * gs * ghost_scale;
                                 }
-                                // the cursor: light of its own at the level stored
-                                // ink reaches, so it reads as a mark on the face and
-                                // takes the same halo the rest of the ink does
-                                if let Some((cx0, cx1, cy0, cy1)) = cursor_rect {
-                                    if x as i32 >= cx0
-                                        && x as i32 <= cx1
-                                        && y <= cy1 as i64
-                                        && y >= cy0 as i64
-                                    {
-                                        light += gs;
+                                // the cursor: light with the same Gaussian footprint a
+                                // stroke deposits, so the underline is as thick and as
+                                // soft as the glyphs beside it, and takes the same halo.
+                                // Light rather than charge: see `Tube::cursor`.
+                                if let Some(m) = cursor_mark {
+                                    let dyy = y as f32 - m.y as f32;
+                                    if dyy.abs() <= cursor_reach {
+                                        let dxx =
+                                            x as f32 - (x as f32).clamp(m.x0 as f32, m.x1 as f32);
+                                        let cov =
+                                            (-(dxx * dxx + dyy * dyy) * cursor_inv2s2).exp();
+                                        if cov >= PROFILE_CUTOFF {
+                                            light += cursor_gain * cov;
+                                            fl += cursor_fresh * cov;
+                                        }
                                     }
                                 }
                                 fl += fresh[i] * gf;
@@ -2468,13 +2504,29 @@ mod tests {
         };
         t.render_into(&mut buf, 1, 1);
         let before = green(&buf, 150, 300);
-        t.cursor = Some((100, 200, 300, 301));
+        t.cursor = Some(CursorMark { x0: 100, x1: 200, y: 300, sigma: 1.5 });
         t.render_into(&mut buf, 1, 1);
         let after = green(&buf, 150, 300);
         assert!(
             after > before + 20,
             "the mark has to be light where it is: {before} -> {after} (stored_gain {})",
             t.phosphor.stored_gain
+        );
+        // and it is a *stroke*, not a bar: the light falls away over several dots the
+        // way a stroke's Gaussian profile does, rather than ending in a step
+        let above = |buf: &Vec<u32>, d: i32| green(buf, 150, 300 + d);
+        let (one, three, six) = (above(&buf, 1), above(&buf, 3), above(&buf, 6));
+        assert!(
+            after > one && one > three && three > six,
+            "the underline has to fade out over its width: 0 {after}, 1 {one}, 3 {three}, 6 {six}"
+        );
+        assert!(
+            three - before > 20,
+            "and be thick enough to read: {three} against the blank {before}"
+        );
+        assert!(
+            six < three,
+            "and it keeps falling at the edge: {six} against {three}"
         );
         assert!(
             !t.transients_alive(),

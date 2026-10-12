@@ -2973,6 +2973,16 @@ mod harness {
                 rows
             );
             println!("CURSOR samples: {:?}", &samples[..samples.len().min(20)]);
+            // the shape of the underline across its width: a stroke fades out over
+            // several dots, a rectangle would step
+            if let Some(m) = tube.cursor {
+                let profile: Vec<i32> = ((m.y - 6)..=(m.y + 6))
+                    .map(|yy| {
+                        sample(&mut tube, &mut buf, Some(((m.x0 + m.x1) / 2, yy))).unwrap_or(-1)
+                    })
+                    .collect();
+                println!("CURSOR profile across it (y-6..y+6): {profile:?}");
+            }
         }
 
         let seq = std::env::var("TEK_SEQ").ok();

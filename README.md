@@ -423,10 +423,17 @@ again on a clock is the other obvious answer and it is the wrong one - a flash t
 refreshed never lets the tube's aliveness check clear, so a 1024x780 frame would be
 recomposed some 58 times a second, forever, for one underline.  The hardware's own
 hosts wrote a cursor as *stored* ink and redrew the page to move it, which is a steady
-mark, and that is what this is:
+mark, and that is what this is - a *stroke*, not a bar:
 
-* drawn at the level stored ink reaches, so it reads as ink on the face and takes the
-  same halo the rest of the ink does;
+* stroked with the same width and the same Gaussian beam profile the terminal's glyphs
+  are stroked with, so it is as thick and as soft as the letters beside it rather than a
+  crisp rectangle of a width nobody chose: across its own width the light falls away
+  `89, 90, 123, 164, 211, 250, 255, 251, 212, 164, 124, 88, 89` - six dots of glow
+  either side of the centre line;
+* drawn at the level a *just written* stroke reaches, with its light in the fresh
+  channel too, because that is the channel the colour pass reads for the hot
+  chromaticity - so the underline is white-green like fresh ink and not a flat bar of
+  settled green, which is what a host keeping its cursor written would leave;
 * not charge in any population, so erasing the target does not blink it and moving it
   leaves no trail of itself;
 * and not a *transient*, so it does not make the tube alive: an idle prompt still stops
@@ -439,14 +446,15 @@ a blank cell at the same height as the floor the flood gun sets):
 
 | cursor | dimmest | brightest | blank cell |
 |---|---|---|---|
-| this | **188** | 188 | 76 |
+| this (a stroked mark at fresh-ink level) | **255** | 255 | 76 |
+| the first attempt (a rectangle of settled green) | **188** | 188 | 76 |
 | before (a transient, never rewritten - `v0.3.1`) | **77** | 206 | 76 |
 
 The old cursor fell to the floor within a second and stayed there, which is the "cursor
 fades away completely" this answers; the new one does not move at all.  It costs
-nothing: a 25 s idle session draws 797 frames against 873 for the transient version,
-both stopping once the trail's own light has decayed, and the mark is simply part of
-whatever frame is drawn next.
+nothing: a 25 s idle session draws ~840 frames against 873 for the transient version,
+both stopping once the trail's own light has decayed (~14 s in), and the mark is simply
+part of whatever frame is drawn next.
 
 **The font is a stroke font, because it has to be.**  A storage tube stores
 whatever the beam traces, and the 4010 stroked its characters rather than
