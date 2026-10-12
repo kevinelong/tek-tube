@@ -26,6 +26,22 @@ More renders in `docs/`: `dissspla.png` (the DISSPLA demo from the video),
 plot), `spacelab.png` (ICEMDDN CAD, matches the reference render),
 `ic-mandala.png`.
 
+## Download
+
+Prebuilt Windows binaries are published in
+**[kevinelong/tek-tube-releases](https://github.com/kevinelong/tek-tube-releases)**:
+the latest release carries `tek-tube.exe` (Windows 10/11, x64, one file, no installer and
+no runtime to install) with its SHA-256 sums.  Unzip it and run it from a shell:
+
+```sh
+tek-tube.exe path\to\05_snoopy.plt
+tek-tube.exe --shell powershell.exe     # the tube *is* the terminal
+```
+
+Every other target (macOS, Linux, anything else) builds from this repository - see
+**Build and run** below.  `tek-tube --help` prints the option list, `samples/` holds
+plot files to play, and `docs/` holds what the output should look like.
+
 ## What is emulated
 
 **The protocol** (`src/protocol.rs`)
@@ -119,7 +135,8 @@ plot), `spacelab.png` (ICEMDDN CAD, matches the reference render),
 
 **Text** is drawn as stroked vectors through the same beam and phosphor model
 (the real terminal had no character ROM in the beam path), using the
-public-domain Hershey fonts (see `NOTICE.md`).
+Hershey vector fonts (permissively licensed, with an acknowledgement and
+no-NTIS-format condition - see `NOTICE.md`).
 
 ## Against real hardware
 
@@ -842,3 +859,15 @@ Nothing has been tested back the other way.  Microsoft's consumer FAQ says Smart
 App Control can be turned on again, the developer doc still calls Off a one-way
 operation, and this machine carries the marker that gates re-enabling; treat it
 as one-way in practice.
+
+## Licence
+
+Source-available under the **Functional Source License 1.1**
+([`LICENSE.md`](./LICENSE.md), `FSL-1.1-MIT`): use it for anything except a product or
+service that competes with tek-tube, and each version converts to the MIT licence two
+years after it is published.  Running it, reading it, modifying it, teaching with it and
+using it inside a company are all inside the grant.  Copyright 2026 Kevin Ernest Long.
+
+The third-party material named in `NOTICE.md` - the Hershey vector fonts, the sample plot
+files and the reference photographs - keeps its own terms and is not covered by that
+licence.

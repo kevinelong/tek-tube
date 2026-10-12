@@ -3,7 +3,7 @@ name = "tek-tube"
 version = "0.1.0"
 edition = "2021"
 description = "Tektronix 4010/4014 storage-tube vector display emulator with phosphor persistence"
-license = "MIT"
+license = "FSL-1.1-MIT"
 
 [dependencies]
 minifb = "0.28"

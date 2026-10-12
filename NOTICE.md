@@ -1,8 +1,9 @@
 # Third party material
 
-## Hershey vector font (`assets/futural.jhf`)
+## Hershey vector fonts (`assets/futural.jhf`, `assets/futuram.jhf`, `assets/gothgbt.jhf`)
 
-The alpha (text) mode glyph outlines are Hershey vector fonts.
+The alpha (text) mode glyph outlines are Hershey vector fonts.  All three `.jhf` files
+are covered by the use restriction below.
 
 ```
 USE RESTRICTION:
