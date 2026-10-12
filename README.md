@@ -224,7 +224,7 @@ of the tube.
 
 ```sh
 cargo build --release          # binary in target/release/tek-tube
-cargo test                     # 21 unit and end-to-end tests
+cargo test                     # 112 unit and end-to-end tests (2 ignored)
 ```
 
 Play a file in a window (ESC or the close button quits):
