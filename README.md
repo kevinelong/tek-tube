@@ -878,6 +878,15 @@ shipped with the Tek4010 emulator (`samples/icemddn_spacelab.png`): the
 orientation/overlap metric is highest for an unrotated match, which caught an
 upside-down output bug during development.
 
+`tests/release_tooling.rs` covers the Windows release surface rather than the tube: the four
+scripts the published archive ships (`setup.cmd`, `setup.ps1`, `uninstall.cmd`, `uninstall.ps1`)
+must exist, must be **CRLF**, and each `.cmd` must reach its `.ps1` sibling through `%~dp0` so the
+pair travels together in the archive. It also requires `uninstall.cmd`'s self-delete line to still
+be present and still come before the script exits - that ordering is what lets cmd delete the file
+it is reading - and `LICENSE.md` / `NOTICE.md` to be present, because the archive carries the
+licence as text rather than a link. `RELEASING.md` and `.gitattributes` promised all of that and
+nothing checked it.
+
 ## Sample plot files
 
 `samples/` holds demo files used for testing, collected by Chuck Forsberg and
