@@ -862,7 +862,7 @@ the target, and can be magnified with `--zoom`.
 
 ## Verification
 
-What to run, and what it proves.  All five commands were re-run on 2026-10-15 and their
+What to run, and what it proves.  Every command below was re-run on 2026-10-15 and the
 observed output - counts, colours, frame numbers - recorded in
 [`docs/CONTINUE.md`](docs/CONTINUE.md); the figures quoted in this section are current as
 of that pass.

@@ -21,7 +21,7 @@ checked against the repository and against the published v0.3.4.
 
 | | |
 |---|---|
-| Source | `tek-tube`, clean and in sync; this note became tracked here in this commit |
+| Source | `tek-tube` at **`096e177`**, clean and in sync; the note became tracked here in that commit |
 | Tests | `cargo test` **and** `cargo test --release`: **128 pass, 0 fail, 2 ignored** (123 in `src/main.rs`, 5 in `tests/release_tooling.rs`) |
 | Releases | unchanged: `kevinelong/tek-tube-releases` latest **v0.3.4**, `tek-tube-0.3.4-win64.zip` 461,836 bytes plus `SHA256SUMS.txt`; nothing published this pass |
 | CI | **none** - still no workflow in this repository, so the 128 tests run nowhere but here |
