@@ -6,9 +6,9 @@ model (`src/`), the tests, the build tooling (`tools/`), and the documentation.
 
 The third-party material listed in `NOTICE.md` keeps its own terms and is not licensed
 under these Terms and Conditions: the Hershey vector fonts (`assets/*.jhf`), the sample
-plot files (`samples/`), and the reference photographs (`ref/`,
-`docs/reference-real-4010.jpg`). The libraries listed in `Cargo.toml` keep their own
-licences too.
+plot files (`samples/`), and the reference photographs (`docs/reference-real-4010.jpg`,
+plus the untracked measurement set in the checkout's parent directory, `../ref/`). The
+libraries listed in `Cargo.toml` keep their own licences too.
 
 No code from another emulator is used; `src/` is an independent implementation, as
 `NOTICE.md` records.

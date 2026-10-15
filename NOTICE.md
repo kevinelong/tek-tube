@@ -34,7 +34,7 @@ licensed; the loader in that repository is GPL and was **not** used - the
 `.jhf` parser in `src/font.rs` was written from the format description in the
 original distribution notes).
 
-## Reference photographs (`ref/`, `docs/reference-real-4010.jpg`)
+## Reference photographs (`docs/reference-real-4010.jpg`, `../ref/`)
 
 Colour and texture calibration uses photographs of **real hardware only**
 (no emulator or simulator screenshots):
@@ -51,8 +51,10 @@ Colour and texture calibration uses photographs of **real hardware only**
   <https://www.youtube.com/watch?v=2SbCIP1m6hs>) for the flash colour, the
   trail length and the drawing order.
 
-These photographs remain the property of their sources and are kept here only
-as measurement references.
+These photographs remain the property of their sources and are kept only as measurement
+references.  They sit outside this repository, in `ref/` beside the checkout (`../ref/` from
+the repository root), and are not tracked; `docs/reference-real-4010.jpg` is the one that
+ships with the source.
 
 ## Sample plot files (`samples/*.plt`)
 

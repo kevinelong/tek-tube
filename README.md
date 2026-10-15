@@ -26,12 +26,19 @@ More renders in `docs/`: `dissspla.png` (the DISSPLA demo from the video),
 plot), `spacelab.png` (ICEMDDN CAD, matches the reference render),
 `ic-mandala.png`.
 
+**Where the project stands** - what was last measured, what is waiting on a decision, and
+what is next - is the tracked note **[`docs/CONTINUE.md`](docs/CONTINUE.md)**.  It is kept
+in the repository rather than beside it, so a checkout carries the record, and the
+verification pass below is written up there with the output it produced.
+
 ## Download
 
 Prebuilt Windows binaries are published in
 **[kevinelong/tek-tube-releases](https://github.com/kevinelong/tek-tube-releases)**:
-the latest release carries `tek-tube.exe` (Windows 10/11, x64, one file, no installer and
-no runtime to install) with its SHA-256 sums.  Unzip it and run it from a shell:
+the latest release carries a zip holding `tek-tube.exe` (Windows 10/11, x64, one file, no
+installer to run and no runtime to install), the optional Start Menu setup (`setup.cmd`,
+`setup.ps1`, `uninstall.cmd`, `uninstall.ps1` - see **The Windows setup** below) and the
+licence and notices as text, alongside `SHA256SUMS.txt`.  Unzip it and run it from a shell:
 
 ```sh
 tek-tube.exe path\to\05_snoopy.plt
@@ -224,7 +231,7 @@ of the tube.
 
 ```sh
 cargo build --release          # binary in target/release/tek-tube
-cargo test                     # 123 unit and end-to-end tests (2 ignored)
+cargo test                     # 128 tests, 2 ignored (--release runs the same 128)
 ```
 
 Play a file in a window (ESC or the close button quits):
@@ -516,7 +523,8 @@ the page moves, and nothing is rewritten by the beam to make it move.
 
 Only incremental changes are traced, which is what a pen is for.  Same
 measurement with the fix: the page is complete and the beam idle within a frame
-of the shell going quiet.  The recorded frames are in `cls3/` beside the source.
+of the shell going quiet.  The recorded frames are kept beside the source, in
+`C:\Users\kevin\tek\cls3` - outside this checkout.
 
 **Two prompts, and a page that outlived its erase.**  Two separate faults both
 landed on the same symptom - a second `PS C:\Users\kevin>` after an `echo` or a
@@ -854,6 +862,28 @@ the target, and can be magnified with `--zoom`.
 
 ## Verification
 
+What to run, and what it proves.  All five commands were re-run on 2026-10-15 and their
+observed output - counts, colours, frame numbers - recorded in
+[`docs/CONTINUE.md`](docs/CONTINUE.md); the figures quoted in this section are current as
+of that pass.
+
+```sh
+cargo build --release            # the release profile builds clean
+cargo test                       # 128 tests, 2 ignored (--release runs the same 128)
+
+# headless render: the flags the "Useful verification flags" example in
+# Terminal mode uses - decoded stream, one probed dot, the written picture
+target/release/tek-tube.exe samples/isco10.plt --png out.png \
+  --stats --dump-chars --probe 1600,1500
+
+# the shell/session check: a real shell driven through the terminal's own frame
+# loop with no window at all.  That driver is the `harness` module in
+# src/main.rs; it is #[ignore]d, so it is named, and TEK_SCRIPT is typed into
+# the shell.  It prints the frames drawn, the commits echoed and the bytes read.
+TEK_SCRIPT="echo TEKMARK;ver" TEK_SECONDS=3 \
+  cargo test --release -- --ignored --nocapture terminal_loop
+```
+
 `cargo test` covers: the coordinate encoding from the real manual example
 `(23,142)` = `$n W`, field omission, quad-dot addressing with the extra byte on
 the 4014 and its absence on the 4010, alpha layout/cell sizes, form feed,
@@ -884,8 +914,9 @@ must exist, must be **CRLF**, and each `.cmd` must reach its `.ps1` sibling thro
 pair travels together in the archive. It also requires `uninstall.cmd`'s self-delete line to still
 be present and still come before the script exits - that ordering is what lets cmd delete the file
 it is reading - and `LICENSE.md` / `NOTICE.md` to be present, because the archive carries the
-licence as text rather than a link. `RELEASING.md` and `.gitattributes` promised all of that and
-nothing checked it.
+licence as text rather than a link. `RELEASING.md` (which is in the releases repository, where the
+archive is assembled) and this repository's `.gitattributes` promised all of that and nothing
+checked it.
 
 ## Sample plot files
 

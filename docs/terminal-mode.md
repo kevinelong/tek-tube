@@ -121,8 +121,9 @@ all.  `TEK_TUBE_TERM` overrides it, for the one case where advertising an xterm 
 the point.
 
 **Doubled drawing, found by recording the window.**  A `cls` followed by a long
-listing was recorded frame by frame from the live window (grabber and analysis in
-`cls3/`, findings in `cls3/FINDINGS.md`): the shell stopped at t=0.06 s and the
+listing was recorded frame by frame from the live window (grabber and analysis
+kept beside the source in `C:\Users\kevin\tek\cls3`, findings in `FINDINGS.md`
+there - both outside this checkout): the shell stopped at t=0.06 s and the
 tube was still writing the page at t=7.5 s, filling it in from the top row down
 and going back over rows it had already drawn.  The cause was that the committed
 image took each cell's character from the *screen* rather than from what the pen
