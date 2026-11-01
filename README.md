@@ -231,7 +231,7 @@ of the tube.
 
 ```sh
 cargo build --release          # binary in target/release/tek-tube
-cargo test                     # 128 tests, 2 ignored (--release runs the same 128)
+cargo test                     # 131 tests, 2 ignored (--release runs the same 131)
 ```
 
 Play a file in a window (ESC or the close button quits):
@@ -881,12 +881,12 @@ the target, and can be magnified with `--zoom`.
 
 What to run, and what it proves.  Every command below was re-run on 2026-10-15 and the
 observed output - counts, colours, frame numbers - recorded in
-[`docs/CONTINUE.md`](docs/CONTINUE.md); the figures quoted in this section are current as
-of that pass.
+[`docs/CONTINUE.md`](docs/CONTINUE.md); the test counts were re-checked on 2026-10-31,
+when the ghost fix and `wyse hi-res` landed and took them from 128 to 131.
 
 ```sh
 cargo build --release            # the release profile builds clean
-cargo test                       # 128 tests, 2 ignored (--release runs the same 128)
+cargo test                       # 131 tests, 2 ignored (--release runs the same 131)
 
 # headless render: the flags the "Useful verification flags" example in
 # Terminal mode uses - decoded stream, one probed dot, the written picture

@@ -20,9 +20,9 @@ only a file on this machine**.  Both fixed, tested and pushed.
 
 | | |
 |---|---|
-| Source | `tek-tube` at this commit, clean; `cargo test` **131 pass, 0 fail, 2 ignored** (126 in `src/main.rs`, 5 in `tests/release_tooling.rs`) |
+| Source | `tek-tube` at **`279e9f2`**, pushed to `origin/master`, working tree clean; `cargo test` **131 pass, 0 fail, 2 ignored** (126 in `src/main.rs`, 5 in `tests/release_tooling.rs`), in debug and release |
 | Releases | unchanged: latest published is still **v0.3.4**; this work is not released yet |
-| Binaries | `target/release/tek-tube.exe` rebuilt here; it is not byte-identical to the v0.3.4 asset (`236c4d1e...` against the asset's `9536ee85...`) because this machine's toolchain is not the one the release was built with. The installed copy under `%LOCALAPPDATA%\Programs\tek-tube` is untouched, so it is still v0.3.4 |
+| Binaries | `target/release/tek-tube.exe`, sha256 `adf65ce9...`, rebuilt from `279e9f2` here. It is not byte-identical to the v0.3.4 asset (`9536ee85...`) - this machine's toolchain is not the one that asset was built with - and the installed copy under `%LOCALAPPDATA%\Programs\tek-tube` is untouched, so **a Start Menu launch is still v0.3.4 and does not have the ghost fix**. Run the checkout's `target\release\tek-tube.exe` to get it |
 
 ### The overlapping text that never faded out
 
@@ -66,6 +66,29 @@ it duplicated the built-in.  Test
 differ in exactly that one row and that it applies `dots 0` while keeping the black
 face, the stripes, the 0.1 s ghost, the 0.2 s trail and the 19,200 baud link.
 
+`dots` is a **structural** row now, like `font`, in the terminal panel: the stored
+charge was drawn on that grid and a storage tube cannot restyle it, so the page is
+written again when the value settles rather than at the next commit.  That is also
+what makes a preset press honest - `apply_preset_rows` reports a structural row
+moving, so pressing `wyse` turns the page chunky at the settle instead of when the
+panel closes.  The plot panel's `dots` row was left alone: it drives a `Player`, not
+a re-stroke.
+
+### How to pick this up
+
+```sh
+cd C:/Users/kevin/tek/tek-tube
+cargo test                 # 131 pass, 2 ignored ("spawns a real shell")
+cargo build --release
+target/release/tek-tube.exe --wyse-hi --shell powershell.exe   # the traced raster look
+target/release/tek-tube.exe --wyse       --shell powershell.exe # the measured ROM look
+```
+
+In the window: **F2**, then the `preset` row lists `wyse`, `wyse hi-res`, `tek`; **F11**
+fullscreen, **Ctrl+Shift+Q** quits.  A live session that shows the ghost fix is one
+`ls`/`dir` and then *don't touch the keyboard*: the previous page should fade out on
+its own within a second.
+
 ### Still open
 
 - Nothing is measured in the *presented* frame any more: the headless harness composes
@@ -78,6 +101,13 @@ face, the stripes, the 0.1 s ghost, the 0.2 s trail and the 19,200 baud link.
   moving, and `dots` is structural), so the wyse look lands at the settle instead of at
   the next commit.  That costs one page re-stroke per preset press, which has not been
   measured against a session that is mid-output.
+- **No release yet.**  `kevinelong/tek-tube-releases` is still at v0.3.4, so the fix
+  exists only in the checkout.  A 0.3.5 needs: a version bump in `Cargo.toml`, the
+  CHANGELOG entry naming `279e9f2` and the new asset's hashes, the zip with
+  `LICENSE.txt`/`NOTICE.txt`/`THIRD-PARTY-NOTICES.txt`, and `SHA256SUMS.txt`.  Kevin's
+  call, not taken here.
+- The window this session left running is `target/release/tek-tube.exe` (windowed,
+  Windows PowerShell); it was still open at exit and closes with Ctrl+Shift+Q.
 
 ## 2026-10-15 - the documentation and verification pass (superseded by the section above)
 
