@@ -106,8 +106,12 @@ its own within a second.
   CHANGELOG entry naming `279e9f2` and the new asset's hashes, the zip with
   `LICENSE.txt`/`NOTICE.txt`/`THIRD-PARTY-NOTICES.txt`, and `SHA256SUMS.txt`.  Kevin's
   call, not taken here.
-- The window this session left running is `target/release/tek-tube.exe` (windowed,
-  Windows PowerShell); it was still open at exit and closes with Ctrl+Shift+Q.
+- Nothing from this session is left running: the windowed `target/release` instance
+  was closed before the session ended (`tasklist` shows no `tek-tube.exe`), and the
+  throwaway capture drivers in `..\_scratch` were deleted - the frame loop's own
+  `harness` test in `src/main.rs` is the tool that did the measuring, and the three
+  evidence renders kept there are `wyse-full.png` (the ROM look), `wyse-dots0.png`
+  (traced) and `wyse-idle.png` (a settled harness frame).
 
 ## 2026-10-15 - the documentation and verification pass (superseded by the section above)
 
