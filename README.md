@@ -308,8 +308,14 @@ it is down, which is what a drag is.  The wheel nudges the row under the pointer
 The panel is drawn over the frame that is already there, so it stays with the mouse
 while the costly half waits.
 
-Rows are sliders, boxes that toggle, lists that step, and **presets**: `wyse` and
-`tek` as bundles of rows, showing `custom` when the machine matches neither.
+Rows are sliders, boxes that toggle, lists that step, and **presets**: `wyse`,
+`wyse hi-res` and `tek` as bundles of rows, showing `custom` when the machine
+matches none of them.  The two Wyse entries are the same look — black face, scan
+stripes, page-at-a-time changes, the page before left fading, no beam writer, a
+19,200 baud link — except that `wyse hi-res` leaves the glyphs *traced* rather than
+sampled onto the character ROM's 15-row dot grid, which is the one part of the
+raster look that reads as low resolution on a modern fullscreen window rather than
+as a 1980s terminal.
 They can be saved into numbered slots - `slot` names one, `save` writes the
 current rows into it - and the saved ones live in a plain-text file under the
 user's config directory, never in the repository.  The preset chooser is a *view*
@@ -661,7 +667,13 @@ has no such thing - its charge is permanent and a commit *replaces* the image
 rather than merging into it - so this one does not ghost on its own.  `--ghost F`
 captures the page a scroll replaces as a fading layer for F seconds
 (`Tube::capture_ghost`, decayed like the transients and summed into the light, so
-it haloes like everything else).  Default 0: no ghost, which is what the hardware
+it haloes like everything else).  The ghost is light that has already left the
+phosphor, but it is composited into every frame and it fades - so it counts as
+live (`Tube::transients_alive`): a window may only stop composing once it is below
+a display step.  It did not count once, and the frame a window stopped on kept the
+previous page superimposed on the new one at full strength for as long as nothing
+else changed - a whole listing doubled, until the next keystroke forced a frame.
+Default 0: no ghost, which is what the hardware
 being emulated does.  `--slide R` sets the rows a second the display slides a
 scroll at (default 30); `--slide 0` makes a scroll land in one step, which is how
 a raster terminal moves - its screen is static between writes and the movement
@@ -707,7 +719,12 @@ equivalent to
 ```
 
 and any of those can still be overridden by a later flag on the same command
-line.
+line.  The panel also offers **`wyse hi-res`**: that same list with `--dots 0`, so
+the black face, the stripes, the page-at-a-time steps and the paced link are kept
+and only the character ROM's dot grid goes.  It is the Wyse look with legible
+glyphs, which is the better default on a fullscreen window.  `--wyse-hi` is the
+one-flag spelling of the same machine, exactly `--wyse --dots 0` (the two render
+byte-identical frames).
 
 **The image works the way a storage tube forces it to.**  A storage tube cannot
 erase one character, so content that is still moving is written into the

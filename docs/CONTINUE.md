@@ -1,6 +1,6 @@
 # tek-tube: continue here
 
-Started 2026-10-05.  **The live state is the first section**, "Where it stands, 2026-10-15 -
+Started 2026-10-05.  **The live state is the first section**, "Where it stands, 2026-10-31 -
 restart here".  Everything below it is the record, newest session first, of what each one did
 and measured; where an older section disagrees with the top section, the top section wins.
 
@@ -12,7 +12,74 @@ the system changes and their undo (`ELEVATED-SESSION.md`) and the 2026-10-12 lic
 (`LICENSE-SWEEP-2026-10-12.md`) - are still kept outside the checkout in that directory; the
 sections below quote everything a reader of this repository needs from them.
 
-## Where it stands, 2026-10-15 - restart here
+## Where it stands, 2026-10-31 - restart here
+
+Two defects behind one photograph of a doubled listing, plus the preset that should
+have been shipped: **the ghost layer froze on screen** and **the traced Wyse look was
+only a file on this machine**.  Both fixed, tested and pushed.
+
+| | |
+|---|---|
+| Source | `tek-tube` at this commit, clean; `cargo test` **131 pass, 0 fail, 2 ignored** (126 in `src/main.rs`, 5 in `tests/release_tooling.rs`) |
+| Releases | unchanged: latest published is still **v0.3.4**; this work is not released yet |
+| Binaries | `target/release/tek-tube.exe` rebuilt here; it is not byte-identical to the v0.3.4 asset (`236c4d1e...` against the asset's `9536ee85...`) because this machine's toolchain is not the one the release was built with. The installed copy under `%LOCALAPPDATA%\Programs\tek-tube` is untouched, so it is still v0.3.4 |
+
+### The overlapping text that never faded out
+
+Reported from a fullscreen session: after `ls`, two pages sat superimposed for as long
+as the session was idle, and pressing space cleared them.  A fade, so it looked like a
+fade that had stopped - it was a *frame* that had stopped.
+
+`Tube::capture_ghost` keeps the page a scroll replaces; the ghost is composited into
+every frame (`light += ghost[i] * gs * ghost_scale`) and decays in `Tube::decay`.  But
+`Tube::transients_alive` - the one test a window uses to decide whether to compose
+another frame - asked only about `fresh_alive` and `under_alive`.  So the trail died,
+the window stopped composing, and the frame it stopped on still had the captured page
+at whatever strength it held at that moment: both pages, full strength, indefinitely.
+A keystroke changed a cell, forced a recompose, and by then the ghost had long decayed
+- hence "space clears it".
+
+Fixed by making the ghost count: `transients_alive` is
+`fresh_alive || under_alive || ghost_scale > ALIVE_SCALE`, the same sub-display-step
+threshold the other populations use.  Regression test
+`tube::tests::a_whole_page_ghost_keeps_the_tube_alive_until_it_fades`: with nothing but
+a ghost live, the tube is alive and its light is in the composed frame; after decaying
+it stops being alive, in ~13 time constants, and the composed frame is dark.
+
+Measured before the fix, from the program's own numbers, which is why the bug had
+survived: `Tube::stats()` **does not include the ghost**, so the harness' mean light was
+flat and a keystroke only ever *added* 0.5 % light.  The window loop's `alive=false`
+was read as "resolved" when it meant "stopped composing".  Anything measured about
+fades has to read `render_into`, which composites the ghost, not `stats()`.
+
+### `wyse hi-res`, shipped
+
+The traced variant of the Wyse look was written into
+`%APPDATA%\tek-tube\presets.txt` on this machine in the previous session, which is not
+a default anybody else gets.  It is now a built-in preset next to `wyse` and `tek`:
+`PRESETS` lists it, `preset_rows` answers it, and `WYSE_HI` is derived from `WYSE`
+with the `dots` row set to 0, so the two cannot drift, and `--wyse-hi` is the
+command-line spelling of the same list (`--wyse --dots 0`; the two render
+byte-identical `--vt-replay` frames, `d82c733b...`).  The user file was deleted -
+it duplicated the built-in.  Test
+`tests::the_hi_res_wyse_is_the_wyse_look_without_the_dot_grid` pins that the two lists
+differ in exactly that one row and that it applies `dots 0` while keeping the black
+face, the stripes, the 0.1 s ghost, the 0.2 s trail and the 19,200 baud link.
+
+### Still open
+
+- Nothing is measured in the *presented* frame any more: the headless harness composes
+  on demand (`lit`), so it cannot see a present-loop freeze, and the desktop here was in
+  use, which made screen captures unreliable.  The defect above was found by reading the
+  loop's own numbers (`alive=false` while a ghost was still in the frame) and is now
+  pinned by the tube-level test; a window-level test that composes only while
+  `transients_alive` and then compares the last frame would close the gap properly.
+- Pressing a preset now rewrites the page (`apply_preset_rows` reports a structural row
+  moving, and `dots` is structural), so the wyse look lands at the settle instead of at
+  the next commit.  That costs one page re-stroke per preset press, which has not been
+  measured against a session that is mid-output.
+
+## 2026-10-15 - the documentation and verification pass (superseded by the section above)
 
 A documentation and verification pass.  **No source and no test changed.**  The state note
 moved into the repository as this file, `README.md` points at it, the verification the README

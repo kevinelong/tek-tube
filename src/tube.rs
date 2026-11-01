@@ -1601,8 +1601,17 @@ impl Tube {
     /// Are the transient populations still emitting?  When this is false and
     /// no new input has arrived, the target is not changing, and a window can
     /// skip recomposing the frame entirely.
+    ///
+    /// The ghost counts, and it did not once: `capture_ghost` keeps the page a
+    /// scroll replaces, it is composited into every frame, and it decays - but
+    /// it was left out of this test.  So when the trail population died first the
+    /// terminal stopped composing while the captured page was still bright, and
+    /// that frame *stayed* on screen: the previous page, superimposed on the new
+    /// one at full strength, until a keystroke forced the next recompose.  In
+    /// `--wyse`, whose trail (0.2 s) dies before a ghost taken at the same commit
+    /// (0.1 s tau, but captured later) has gone, that is every listing.
     pub fn transients_alive(&self) -> bool {
-        self.fresh_alive || self.under_alive
+        self.fresh_alive || self.under_alive || self.ghost_scale > Self::ALIVE_SCALE
     }
 
     /// Mean emitted light of the whole target, plus the fraction of the target
@@ -2216,6 +2225,50 @@ mod tests {
             worst > 20,
             "the scan must band the light, worst row step was {worst}"
         );
+    }
+
+    /// A ghost is light that has already left the phosphor, so it is not charge -
+    /// but it is composited into every frame and it fades, so a window has to keep
+    /// composing while it is there.  It was left out of `transients_alive`, and
+    /// the result was the previous page frozen on the face, superimposed on the
+    /// new one at full strength, until the next keystroke forced a recompose.
+    #[test]
+    fn a_whole_page_ghost_keeps_the_tube_alive_until_it_fades() {
+        let lit = |t: &mut Tube| {
+            let mut buf = Vec::new();
+            t.render_into(&mut buf, 1, 1);
+            buf.iter().filter(|p| ((**p >> 8) & 0xff) > 100).count()
+        };
+        let mut t = Tube::new(128, 96);
+        t.ghost_tau = 0.1;
+        for y in 20..70 {
+            for x in 10..120 {
+                t.stored[(y * 128 + x) as usize] = 0.6;
+            }
+        }
+        t.capture_ghost();
+        // the commit that follows clears the charge; only the light is left
+        t.clear_stored();
+        assert!(
+            !t.fresh_alive && !t.under_alive,
+            "nothing but the ghost is live here, so this test really is about it"
+        );
+        assert!(t.transients_alive(), "the page before the commit is still lit");
+        assert!(lit(&mut t) > 0, "and it is what a composed frame shows");
+        let mut waited = 0.0f32;
+        while t.transients_alive() && waited < 5.0 {
+            t.decay(0.05);
+            waited += 0.05;
+        }
+        assert!(
+            !t.transients_alive(),
+            "once it is below a display step the ghost stops counting"
+        );
+        assert!(
+            waited < t.ghost_tau * 20.0,
+            "thirteen time constants takes it below a display step, not {waited} s"
+        );
+        assert_eq!(lit(&mut t), 0, "and there is nothing left of it to show");
     }
 
     #[test]

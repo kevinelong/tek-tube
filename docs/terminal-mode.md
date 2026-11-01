@@ -80,13 +80,15 @@ The plot-only options are deliberately **not** in the panel: `--device`,
 Graphics Module, and a terminal run honours none of them.  A control that moved a
 number nothing reads would be worse than no control at all.
 
-Two of the rows are buttons rather than values: **`wyse`** and **`tek`**.  A preset
-is several variables at once, which is an action rather than a setting, so the row
-carries no value of its own: the press writes the preset's values into the panel's
-own rows, which are then applied through the same mapping the command line uses -
-`--wyse` and the `wyse` button share one list, so they cannot drift.  `tek` is not
-a table of numbers at all: it is "what a machine built with nothing given to it
-reports", computed at the press by the same two calls a launch makes.
+Three of the rows are buttons rather than values: **`wyse`**, **`wyse hi-res`** and
+**`tek`**.  A preset is several variables at once, which is an action rather than a
+setting, so the row carries no value of its own: the press writes the preset's
+values into the panel's own rows, which are then applied through the same mapping
+the command line uses - `--wyse` and the `wyse` button share one list, so they
+cannot drift, and `wyse hi-res` is that same list with the dot grid row set to 0
+(`--wyse --dots 0`), so the two cannot drift either.  `tek` is not a table of
+numbers at all: it is "what a machine built with nothing given to it reports",
+computed at the press by the same two calls a launch makes.
 
 **What the terminal answers to.**  Cursor addressing, the erase and editing
 families, scroll regions, the alternate screen, cursor save/restore (DECSC/DECRC,

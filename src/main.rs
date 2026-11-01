@@ -270,6 +270,9 @@ Usage: tek-tube [options] file.plt [more.plt ...]
                             Equivalent to --write-rate 0 --slide 0 --ghost 0.1
                             --scan 0.5 --dots 15 --ambient 0 --trail 0.2
                             --baud 19200; a later flag overrides any of them
+  --wyse-hi                 the same look with the dot matrix face left out
+                            (--dots 0), so the glyphs are traced and legible at a
+                            fullscreen cell size.  The panel offers it as a preset
   --lens F                  the phone camera the source footage was shot on: F
                             is the lens blur and grain, 0 (the default) is the
                             sharp device.  It applies no contrast curve, unlike
@@ -1155,7 +1158,7 @@ const SHRINKS: &[&str] = &["auto", "1", "2", "3", "4", "5", "6", "8"];
 /// The built-in presets the chooser offers, in the order it lists them.  The
 /// user's saved presets follow them; one past the end of the whole list is
 /// `custom`: the rows match none of them.
-const PRESETS: &[&str] = &["wyse", "tek"];
+const PRESETS: &[&str] = &["wyse", "wyse hi-res", "tek"];
 
 /// One preset: a name and the panel rows it sets.  The row names are owned
 /// because a saved one comes from the user's file, which may name a row this
@@ -1422,6 +1425,21 @@ const WYSE: &[(&str, f32)] = &[
     ("baud", 19200.0),
 ];
 
+/// The `wyse` look with the glyphs *traced* instead of sampled onto a character
+/// ROM's dot grid - one number different, `dots 0`, and taken from `WYSE` so the
+/// two cannot drift.
+///
+/// It is a preset of its own because the grid is the one part of the raster look
+/// that argues with a modern window: 15 dot rows over a 45 dot cell is a very
+/// coarse face, and on a fullscreen page it reads as low resolution rather than as
+/// a terminal.  The black face, the stripes, the page-at-a-time steps and the paced
+/// link are what make it a Wyse; the dot grid is only what makes it a 1980s ROM.
+static WYSE_HI: LazyLock<Vec<(&'static str, f32)>> = LazyLock::new(|| {
+    WYSE.iter()
+        .map(|(name, value)| (*name, if *name == "dots" { 0.0 } else { *value }))
+        .collect()
+});
+
 /// The `tek` preset: what a machine built with nothing given to it reports,
 /// computed here by the same two calls a launch makes, so the preset cannot drift
 /// from the defaults it means.  Built once, because the chooser reads it on every
@@ -1443,11 +1461,13 @@ static TEK: LazyLock<Vec<(&'static str, f32)>> = LazyLock::new(|| {
 /// The rows a preset sets, in the panel's own names, or None if the name is not a
 /// preset.
 ///
-/// `wyse` is a list of numbers, written out.  `tek` is not: it is read off a fresh
+/// `wyse` is a list of numbers, written out, and `wyse hi-res` is that list with
+/// the dot grid taken out.  `tek` is not a table at all: it is read off a fresh
 /// machine, so it cannot drift from the defaults it means.
 fn preset_rows(name: &str) -> Option<&'static [(&'static str, f32)]> {
     match name {
         "wyse" => Some(WYSE),
+        "wyse hi-res" => Some(&WYSE_HI),
         "tek" => Some(&TEK),
         _ => None,
     }
@@ -1456,20 +1476,23 @@ fn preset_rows(name: &str) -> Option<&'static [(&'static str, f32)]> {
 /// Apply a preset to the panel's rows: everything a preset press means.  A saved
 /// preset goes through the same path as a built-in, so it cannot mean something
 /// different from one, and a row it names that this build has not got is left out
-/// rather than fatal.  Returns true if the page has to be written again, which
-/// only the cell size forces.
+/// rather than fatal.  Returns true if the page has to be written again: when a
+/// *structural* row moved - the cell size, the face, the dot grid.  Those are the
+/// rules the stored charge was drawn under, and a storage tube cannot restyle it,
+/// so the page is re-stroked rather than left in the old rendering.
 fn apply_preset_rows(rows: &mut [panel::Row], name: &str, presets: &Presets) -> bool {
     let Some(bundle) = presets.bundle(name) else {
         return false;
     };
-    let cell_before = rows.iter().find(|r| r.name == "cell").map(|r| r.value);
+    let before: Vec<(f32, bool)> = rows.iter().map(|r| (r.value, r.structural)).collect();
     for (row_name, value) in &bundle {
         if let Some(row) = rows.iter_mut().find(|r| r.name == row_name.as_str()) {
             row.value = *value;
         }
     }
-    let cell_after = rows.iter().find(|r| r.name == "cell").map(|r| r.value);
-    cell_before != cell_after
+    rows.iter()
+        .zip(&before)
+        .any(|(row, (was, structural))| *structural && (row.value - was).abs() > 1e-6)
 }
 
 /// The options panel's rows: the variables a terminal run honours.
@@ -1527,7 +1550,11 @@ fn raw_rows(opts: &Options, tube: &Tube, presets: &Presets) -> Vec<panel::Row> {
         toggle("camera", opts.camera as u8 as f32, false),
         structural_choice("font", FONTS, index_of(FONTS, face_name(opts.font))),
         slider("scan", 0.0, 0.95, ph.scan_depth, false),
-        slider("dots", 0.0, 32.0, tube.dot_rows as f32, false),
+        // A glyph-shape rule like the face, and for the same reason: the grid a
+        // letter is drawn on cannot restyle charge that is already stored, so the
+        // page has to be written again.  Left non-structural it only landed at the
+        // next commit, which read as "the page turns chunky when I close the panel".
+        slider("dots", 0.0, 32.0, tube.dot_rows as f32, true),
         slider("trail", 0.0, 2.0, opts.trail.unwrap_or(1.1), false),
         slider(
             "write-rate",
@@ -3189,6 +3216,13 @@ where
                     apply_value(&mut o, name, *v);
                 }
             }
+            "--wyse-hi" => {
+                // the same list with the dot grid left out, derived from WYSE so
+                // the flag, the preset row and the table cannot drift apart
+                for (name, v) in WYSE_HI.iter() {
+                    apply_value(&mut o, name, *v);
+                }
+            }
             "--cell" => o.cell = Some(value("--cell")?.parse()?),
             "--no-autoclear" => o.autoclear = false,
             "--no-enhanced" => o.enhanced = false,
@@ -3283,8 +3317,9 @@ mod tests {
         structural.sort_unstable();
         assert_eq!(
             structural,
-            vec!["cell", "font"],
-            "the cell size and the face are the rows the page has to be written again for"
+            vec!["cell", "dots", "font"],
+            "the cell size, the dot grid and the face are the rows the page has to be \
+             written again for: each is a rule the stored charge was drawn under"
         );
         let structural = apply_rows(&mut opts, &rows);
         assert!(structural, "the cell row is structural");
@@ -3418,6 +3453,43 @@ mod tests {
         rows.iter().find(|r| r.name == name).expect("the row").value
     }
 
+    /// The hi-res Wyse is the Wyse look with the character-ROM grid taken out:
+    /// one row different, and it is the row that argues with a modern window,
+    /// because 15 dot rows over a 45 dot cell is a very coarse face.
+    #[test]
+    fn the_hi_res_wyse_is_the_wyse_look_without_the_dot_grid() {
+        let wyse = preset_rows("wyse").expect("the measured look");
+        let hi = preset_rows("wyse hi-res").expect("the traced variant");
+        assert_eq!(wyse.len(), hi.len(), "the same rows, not a different preset");
+        for ((name, value), (name_hi, value_hi)) in wyse.iter().zip(hi) {
+            assert_eq!(name, name_hi, "row for row");
+            if *name == "dots" {
+                assert_eq!(*value, 15.0, "the measured grid");
+                assert_eq!(*value_hi, 0.0, "and the grid is the whole difference");
+            } else {
+                assert_eq!(value, value_hi, "{name} is part of the look, so kept");
+            }
+        }
+
+        let mut opts = Options::default();
+        let mut tube = configured(Tube::new(1024, 780), &opts);
+        let mut rows = panel_rows(&opts, &tube, &Presets::builtins());
+        assert!(!apply_preset_rows(
+            &mut rows,
+            "wyse hi-res",
+            &Presets::builtins()
+        ));
+        apply_rows(&mut opts, &rows);
+        tube = configured(tube, &opts);
+        assert_eq!(opts.dots, Some(0), "the glyphs are traced again");
+        assert_eq!(tube.dot_rows, 0);
+        assert_eq!(opts.write_rate, Some(0.0), "still no beam writer");
+        assert_eq!(opts.scan, Some(0.5), "still a raster's own stripes");
+        assert_eq!(opts.ambient, Some(0.0), "still a black face");
+        assert_eq!(opts.ghost, Some(0.1), "still the page before, fading");
+        assert_eq!(opts.baud, 19200.0, "still a paced link");
+    }
+
     /// A preset press sets the rows it names, and the values that follow from
     /// them.  `wyse` asks for an instant page *and* a paced link, which sounds
     /// contradictory until the terminal's two rates are told apart.
@@ -3428,8 +3500,8 @@ mod tests {
         let mut rows = panel_rows(&opts, &tube, &Presets::builtins());
 
         assert!(
-            !apply_preset_rows(&mut rows, "wyse", &Presets::builtins()),
-            "wyse leaves the cell alone, so the page stands"
+            apply_preset_rows(&mut rows, "wyse", &Presets::builtins()),
+            "wyse puts the dot grid on, so the page is written again"
         );
         apply_rows(&mut opts, &rows);
         tube = configured(tube, &opts);
@@ -3480,26 +3552,33 @@ mod tests {
         let mut tube = configured(Tube::new(1024, 780), &opts);
         let mut rows = panel_rows(&opts, &tube, &Presets::builtins());
 
+        let tek_index = PRESETS.iter().position(|p| *p == "tek").expect("tek");
         assert_eq!(
             preset_index(&rows, &Presets::builtins()),
-            1,
+            tek_index,
             "a fresh machine is the tek defaults"
         );
         assert_eq!(shown(&rows), "tek");
 
-        // set to each preset in turn
-        apply_preset_rows(&mut rows, "wyse", &Presets::builtins());
-        apply_rows(&mut opts, &rows);
-        tube = configured(tube, &opts);
-        rows = panel_rows(&opts, &tube, &Presets::builtins());
-        assert_eq!(preset_index(&rows, &Presets::builtins()), 0);
-        assert_eq!(shown(&rows), "wyse");
+        // set to each fixed preset in turn, in the chooser's own order
+        for (index, name) in PRESETS
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| **p != "tek")
+        {
+            apply_preset_rows(&mut rows, name, &Presets::builtins());
+            apply_rows(&mut opts, &rows);
+            tube = configured(tube, &opts);
+            rows = panel_rows(&opts, &tube, &Presets::builtins());
+            assert_eq!(preset_index(&rows, &Presets::builtins()), index, "{name}");
+            assert_eq!(shown(&rows), *name);
+        }
 
         apply_preset_rows(&mut rows, "tek", &Presets::builtins());
         apply_rows(&mut opts, &rows);
         tube = configured(tube, &opts);
         rows = panel_rows(&opts, &tube, &Presets::builtins());
-        assert_eq!(preset_index(&rows, &Presets::builtins()), 1);
+        assert_eq!(preset_index(&rows, &Presets::builtins()), tek_index);
         assert_eq!(shown(&rows), "tek");
 
         // one value off a preset and the machine matches neither of them
@@ -3533,8 +3612,8 @@ mod tests {
         let chosen = rows[0].shown();
         assert_eq!(chosen, "wyse");
         assert!(
-            !apply_preset_rows(&mut rows, &chosen, &Presets::builtins()),
-            "wyse leaves the cell alone, so the page stands"
+            apply_preset_rows(&mut rows, &chosen, &Presets::builtins()),
+            "wyse turns the dot grid on, so the page is written again"
         );
         apply_rows(&mut opts, &rows);
         assert_eq!(opts.write_rate, Some(0.0), "no beam writer");
@@ -3639,6 +3718,30 @@ mod tests {
         assert_eq!(back.files, vec![PathBuf::from("plot.plt")]);
     }
 
+    /// The one-flag spelling of the traced Wyse look has to be the same machine as
+    /// the two-flag one, or the panel's preset and the command line disagree.
+    #[test]
+    fn the_hi_res_flag_is_wyse_without_the_dot_grid() {
+        let one = parse_args_from(vec!["--wyse-hi".to_string()].into_iter())
+            .expect("accepted")
+            .expect("not a help request");
+        let two = parse_args_from(
+            vec!["--wyse".to_string(), "--dots".to_string(), "0".to_string()].into_iter(),
+        )
+        .expect("accepted")
+        .expect("not a help request");
+        assert_eq!(one.dots, Some(0), "the grid is what the flag leaves out");
+        assert_eq!(one.dots, two.dots);
+        assert_eq!(one.scan, two.scan);
+        assert_eq!(one.ambient, two.ambient);
+        assert_eq!(one.ghost, two.ghost);
+        assert_eq!(one.trail, two.trail);
+        assert_eq!(one.write_rate, two.write_rate);
+        assert_eq!(one.slide, two.slide);
+        assert_eq!(one.baud, two.baud);
+        assert_eq!(one.baud_given, two.baud_given, "the link is paced either way");
+    }
+
     /// A terminal relaunch names the shell and the face and no files, so the fresh
     /// process comes back as a terminal rather than trying to play a plot.
     #[test]
@@ -3686,7 +3789,12 @@ mod tests {
         };
         assert_eq!(
             presets.names(),
-            vec!["wyse".to_string(), "tek".to_string(), "user 1".to_string()],
+            vec![
+                "wyse".to_string(),
+                "wyse hi-res".to_string(),
+                "tek".to_string(),
+                "user 1".to_string()
+            ],
             "the saved preset joins the chooser after the built-ins"
         );
 
